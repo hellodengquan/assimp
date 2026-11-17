@@ -1,0 +1,90 @@
+; FBX 7.4.0 project file
+; Hand-written fixture for the assimp FBX importer unit tests.
+; Only a handful of quads, so it stays readable and tiny.
+; Distributed under the same BSD-3-Clause license as assimp itself.
+; ----------------------------------------------------
+
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+	Creator: "assimp unit test"
+}
+
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",1
+	}
+}
+
+Objects:  {
+	Geometry: 100, "Geometry::RotationPivotGeometry", "Mesh" {
+		Vertices: *12 { a: 0,0,0, 1,0,0, 1,1,0, 0,1,0 }
+		PolygonVertexIndex: *4 { a: 0,1,2,-4 }
+	}
+	Geometry: 101, "Geometry::RotationPivotChildGeometry", "Mesh" {
+		Vertices: *12 { a: 0,0,0, 1,0,0, 1,1,0, 0,1,0 }
+		PolygonVertexIndex: *4 { a: 0,1,2,-4 }
+	}
+	Geometry: 102, "Geometry::ScalingPivotGeometry", "Mesh" {
+		Vertices: *12 { a: 0,0,0, 1,0,0, 1,1,0, 0,1,0 }
+		PolygonVertexIndex: *4 { a: 0,1,2,-4 }
+	}
+	Geometry: 103, "Geometry::PreRotationGeometry", "Mesh" {
+		Vertices: *12 { a: 0,0,0, 1,0,0, 1,1,0, 0,1,0 }
+		PolygonVertexIndex: *4 { a: 0,1,2,-4 }
+	}
+	Model: 200, "Model::RotationPivotNode", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",1,0,0
+			P: "RotationPivot", "Vector3D", "Vector", "",2,0,0
+			P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,90
+		}
+		Shading: T
+		Culling: "CullingOff"
+	}
+	Model: 300, "Model::RotationPivotChild", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,0,1
+		}
+		Shading: T
+		Culling: "CullingOff"
+	}
+	Model: 400, "Model::ScalingPivotNode", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "ScalingPivot", "Vector3D", "Vector", "",1,0,0
+			P: "Lcl Scaling", "Lcl Scaling", "", "A",2,2,2
+		}
+		Shading: T
+		Culling: "CullingOff"
+	}
+	Model: 500, "Model::PreRotationNode", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "PreRotation", "Vector3D", "Vector", "",0,0,90
+			P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,90
+		}
+		Shading: T
+		Culling: "CullingOff"
+	}
+}
+
+Connections:  {
+	C: "OO",200,0
+	C: "OO",300,200
+	C: "OO",400,0
+	C: "OO",500,0
+	C: "OO",100,200
+	C: "OO",101,300
+	C: "OO",102,400
+	C: "OO",103,500
+}

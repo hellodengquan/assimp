@@ -1,0 +1,75 @@
+; FBX 7.4.0 project file
+; Hand-written fixture for the assimp FBX importer unit tests.
+; Only a handful of quads, so it stays readable and tiny.
+; Distributed under the same BSD-3-Clause license as assimp itself.
+; ----------------------------------------------------
+
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+	Creator: "assimp unit test"
+}
+
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",1
+	}
+}
+
+Objects:  {
+	Geometry: 100, "Geometry::GeoParentGeometry", "Mesh" {
+		Vertices: *12 { a: 0,0,0, 1,0,0, 1,1,0, 0,1,0 }
+		PolygonVertexIndex: *4 { a: 0,1,2,-4 }
+	}
+	Geometry: 101, "Geometry::GeoChildGeometry", "Mesh" {
+		Vertices: *12 { a: 0,0,0, 1,0,0, 1,1,0, 0,1,0 }
+		PolygonVertexIndex: *4 { a: 0,1,2,-4 }
+	}
+	Geometry: 102, "Geometry::GeoLeafGeometry", "Mesh" {
+		Vertices: *12 { a: 0,0,0, 1,0,0, 1,1,0, 0,1,0 }
+		PolygonVertexIndex: *4 { a: 0,1,2,-4 }
+	}
+	Model: 200, "Model::GeoParent", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",1,0,0
+			P: "GeometricTranslation", "Vector3D", "Vector", "",10,0,0
+			P: "GeometricScaling", "Vector3D", "Vector", "",2,2,2
+		}
+		Shading: T
+		Culling: "CullingOff"
+	}
+	Model: 300, "Model::GeoChild", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,0,1
+		}
+		Shading: T
+		Culling: "CullingOff"
+	}
+	Model: 400, "Model::GeoLeaf", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",4,0,0
+			P: "GeometricTranslation", "Vector3D", "Vector", "",0,5,0
+		}
+		Shading: T
+		Culling: "CullingOff"
+	}
+}
+
+Connections:  {
+	C: "OO",200,0
+	C: "OO",300,200
+	C: "OO",400,0
+	C: "OO",100,200
+	C: "OO",101,300
+	C: "OO",102,400
+}
