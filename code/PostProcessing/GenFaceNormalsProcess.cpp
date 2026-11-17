@@ -45,6 +45,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include "GenFaceNormalsProcess.h"
+#include "ProcessHelper.h"
 #include <assimp/Exceptional.h>
 #include <assimp/postprocess.h>
 #include <assimp/qnan.h>
@@ -91,58 +92,14 @@ void GenFaceNormalsProcess::Execute(aiScene *pScene) {
 
 namespace {
 
-template<class XMesh>
-void updateXMeshVertices(XMesh *pMesh, std::vector<int> &uniqueVertices) {
-    // replace vertex data with the unique data sets
-    pMesh->mNumVertices = static_cast<unsigned int>(uniqueVertices.size());
-
-    // ----------------------------------------------------------------------------
-    // NOTE - we're *not* calling Vertex::SortBack() because it would check for
-    // presence of every single vertex component once PER VERTEX. And our CPU
-    // dislikes branches, even if they're easily predictable.
-    // ----------------------------------------------------------------------------
-
-    // Position, if present (check made for aiAnimMesh)
-    if (pMesh->mVertices) {
-        std::unique_ptr<aiVector3D[]> oldVertices(pMesh->mVertices);
-        pMesh->mVertices = new aiVector3D[pMesh->mNumVertices];
-        for (unsigned int a = 0; a < pMesh->mNumVertices; a++) {
-            pMesh->mVertices[a] = oldVertices[uniqueVertices[a]];
-        }
-    }
-
-    // Tangents, if present
-    if (pMesh->mTangents) {
-        std::unique_ptr<aiVector3D[]> oldTangents(pMesh->mTangents);
-        pMesh->mTangents = new aiVector3D[pMesh->mNumVertices];
-        for (unsigned int a = 0; a < pMesh->mNumVertices; a++) {
-            pMesh->mTangents[a] = oldTangents[uniqueVertices[a]];
-        }
-    }
-    // Bitangents as well
-    if (pMesh->mBitangents) {
-        std::unique_ptr<aiVector3D[]> oldBitangents(pMesh->mBitangents);
-        pMesh->mBitangents = new aiVector3D[pMesh->mNumVertices];
-        for (unsigned int a = 0; a < pMesh->mNumVertices; a++) {
-            pMesh->mBitangents[a] = oldBitangents[uniqueVertices[a]];
-        }
-    }
-    // Vertex colors
-    for (unsigned int a = 0; pMesh->HasVertexColors(a); a++) {
-        std::unique_ptr<aiColor4D[]> oldColors(pMesh->mColors[a]);
-        pMesh->mColors[a] = new aiColor4D[pMesh->mNumVertices];
-        for (unsigned int b = 0; b < pMesh->mNumVertices; b++) {
-            pMesh->mColors[a][b] = oldColors[uniqueVertices[b]];
-        }
-    }
-    // Texture coords
-    for (unsigned int a = 0; pMesh->HasTextureCoords(a); a++) {
-        std::unique_ptr<aiVector3D[]> oldTextureCoords(pMesh->mTextureCoords[a]);
-        pMesh->mTextureCoords[a] = new aiVector3D[pMesh->mNumVertices];
-        for (unsigned int b = 0; b < pMesh->mNumVertices; b++) {
-            pMesh->mTextureCoords[a][b] = oldTextureCoords[uniqueVertices[b]];
-        }
-    }
+// ------------------------------------------------------------------------------------------------
+// Replace the per-vertex data of pMesh with the unique data sets described by
+// duplicatedVertices. All attribute streams (positions, tangents, bitangents,
+// every UV and color channel), the attached morph targets and the bone weights
+// are remapped together so that they stay aligned with the new indices.
+void updateXMeshVertices(aiMesh *pMesh, const std::vector<unsigned int> &duplicatedVertices) {
+    const MeshVertexRemap remap(pMesh->mNumVertices, duplicatedVertices);
+    remap.ApplyInPlace(pMesh);
 }
 
 } // namespace
@@ -153,6 +110,9 @@ bool GenFaceNormalsProcess::GenMeshFaceNormals(aiMesh *pMesh) {
     if (nullptr != pMesh->mNormals) {
         if (force_) {
             delete[] pMesh->mNormals;
+            // Line/point meshes return below without new normals, so the freed
+            // pointer must not stay behind: aiMesh would delete it twice.
+            pMesh->mNormals = nullptr;
         } else {
             return false;
         }
@@ -174,9 +134,9 @@ bool GenFaceNormalsProcess::GenMeshFaceNormals(aiMesh *pMesh) {
     std::vector<bool> alreadyReferenced;
     alreadyReferenced.resize(pMesh->mNumVertices, false);
 
-    std::vector<int> duplicatedVertices;
+    std::vector<unsigned int> duplicatedVertices;
     duplicatedVertices.resize(pMesh->mNumVertices);
-    std::iota(std::begin(duplicatedVertices), std::end(duplicatedVertices), 0);
+    std::iota(std::begin(duplicatedVertices), std::end(duplicatedVertices), 0u);
 
     auto storeNormalSplitVertex = [&](unsigned int index, const aiVector3D& normal) {
         if (!alreadyReferenced[index]) {

@@ -159,62 +159,6 @@ struct HashVertex {
     }
 };
 
-template<class XMesh>
-void updateXMeshVertices(XMesh *pMesh, std::vector<int> &uniqueVertices) {
-    // replace vertex data with the unique data sets
-    pMesh->mNumVertices = (unsigned int)uniqueVertices.size();
-
-    // ----------------------------------------------------------------------------
-    // NOTE - we're *not* calling Vertex::SortBack() because it would check for
-    // presence of every single vertex component once PER VERTEX. And our CPU
-    // dislikes branches, even if they're easily predictable.
-    // ----------------------------------------------------------------------------
-
-    // Position, if present (check made for aiAnimMesh)
-    if (pMesh->mVertices) {
-        std::unique_ptr<aiVector3D[]> oldVertices(pMesh->mVertices);
-        pMesh->mVertices = new aiVector3D[pMesh->mNumVertices];
-        for (unsigned int a = 0; a < pMesh->mNumVertices; a++)
-            pMesh->mVertices[a] = oldVertices[uniqueVertices[a]];
-    }
-
-    // Normals, if present
-    if (pMesh->mNormals) {
-        std::unique_ptr<aiVector3D[]> oldNormals(pMesh->mNormals);
-        pMesh->mNormals = new aiVector3D[pMesh->mNumVertices];
-        for (unsigned int a = 0; a < pMesh->mNumVertices; a++)
-            pMesh->mNormals[a] = oldNormals[uniqueVertices[a]];
-    }
-    // Tangents, if present
-    if (pMesh->mTangents) {
-        std::unique_ptr<aiVector3D[]> oldTangents(pMesh->mTangents);
-        pMesh->mTangents = new aiVector3D[pMesh->mNumVertices];
-        for (unsigned int a = 0; a < pMesh->mNumVertices; a++)
-            pMesh->mTangents[a] = oldTangents[uniqueVertices[a]];
-    }
-    // Bitangents as well
-    if (pMesh->mBitangents) {
-        std::unique_ptr<aiVector3D[]> oldBitangents(pMesh->mBitangents);
-        pMesh->mBitangents = new aiVector3D[pMesh->mNumVertices];
-        for (unsigned int a = 0; a < pMesh->mNumVertices; a++)
-            pMesh->mBitangents[a] = oldBitangents[uniqueVertices[a]];
-    }
-    // Vertex colors
-    for (unsigned int a = 0; pMesh->HasVertexColors(a); a++) {
-        std::unique_ptr<aiColor4D[]> oldColors(pMesh->mColors[a]);
-        pMesh->mColors[a] = new aiColor4D[pMesh->mNumVertices];
-        for (unsigned int b = 0; b < pMesh->mNumVertices; b++)
-            pMesh->mColors[a][b] = oldColors[uniqueVertices[b]];
-    }
-    // Texture coords
-    for (unsigned int a = 0; pMesh->HasTextureCoords(a); a++) {
-        std::unique_ptr<aiVector3D[]> oldTextureCoords(pMesh->mTextureCoords[a]);
-        pMesh->mTextureCoords[a] = new aiVector3D[pMesh->mNumVertices];
-        for (unsigned int b = 0; b < pMesh->mNumVertices; b++)
-            pMesh->mTextureCoords[a][b] = oldTextureCoords[uniqueVertices[b]];
-    }
-}
-
 } // namespace
 
 // ------------------------------------------------------------------------------------------------
@@ -244,7 +188,8 @@ int JoinVerticesProcess::ProcessMesh( aiMesh* pMesh, unsigned int meshIndex) {
     }
 
     // We'll never have more vertices afterwards.
-    std::vector<int> uniqueVertices;
+    // This is also the new-index -> source-index mapping handed to the remap.
+    std::vector<unsigned int> uniqueVertices;
 
     // For each vertex the index of the vertex it was replaced by.
     // Since the maximal number of vertices is 2^31-1, the most significand bit can be used to mark
@@ -254,18 +199,6 @@ int JoinVerticesProcess::ProcessMesh( aiMesh* pMesh, unsigned int meshIndex) {
     static_assert(AI_MAX_VERTICES == 0x7fffffff, "AI_MAX_VERTICES == 0x7fffffff");
     std::vector<unsigned int> replaceIndex( pMesh->mNumVertices, 0xffffffff);
 
-    // Run an optimized code path if we don't have multiple UVs or vertex colors.
-    // This should yield false in more than 99% of all imports ...
-    const bool hasAnimMeshes = pMesh->mNumAnimMeshes > 0;
-
-    // We'll never have more vertices afterwards.
-    std::vector<std::vector<int>> uniqueAnimatedVertices;
-    if (hasAnimMeshes) {
-        uniqueAnimatedVertices.resize(pMesh->mNumAnimMeshes);
-        for (unsigned int animMeshIndex = 0; animMeshIndex < pMesh->mNumAnimMeshes; animMeshIndex++) {
-            uniqueAnimatedVertices[animMeshIndex].reserve(pMesh->mNumVertices);
-        }
-    }
     // a map that maps a vertex to its new index
     std::unordered_map<Vertex, int, HashVertex, CompareVerticesAlmostEqual> vertex2Index = {};
     // we can not end up with more vertices than we started with
@@ -288,11 +221,6 @@ int JoinVerticesProcess::ProcessMesh( aiMesh* pMesh, unsigned int meshIndex) {
             replaceIndex[a] = newIndex++;
             // add the vertex to the unique vertices
             uniqueVertices.push_back(a);
-            if (hasAnimMeshes) {
-                for (unsigned int animMeshIndex = 0; animMeshIndex < pMesh->mNumAnimMeshes; animMeshIndex++) {
-                    uniqueAnimatedVertices[animMeshIndex].emplace_back(a);
-                }
-            }
         } else{
             // if the vertex is already there just find the replace index that is appropriate to it
 			// mark it with JOINED_VERTICES_MARK
@@ -314,12 +242,13 @@ int JoinVerticesProcess::ProcessMesh( aiMesh* pMesh, unsigned int meshIndex) {
         );
     }
 
-    updateXMeshVertices(pMesh, uniqueVertices);
-    if (hasAnimMeshes) {
-        for (unsigned int animMeshIndex = 0; animMeshIndex < pMesh->mNumAnimMeshes; animMeshIndex++) {
-            updateXMeshVertices(pMesh->mAnimMeshes[animMeshIndex], uniqueAnimatedVertices[animMeshIndex]);
-        }
-    }
+    // A vertex that survives the join keeps its own bone weights; the weights
+    // of a vertex that was merged into an existing one are dropped (they would
+    // otherwise be counted twice). The same mapping is applied to every present
+    // vertex stream, to all morph targets and to the bone weights, so they stay
+    // aligned with the new indices.
+    const MeshVertexRemap remap(pMesh->mNumVertices, uniqueVertices);
+    remap.ApplyInPlace(pMesh);
 
     // adjust the indices in all faces
     for( unsigned int a = 0; a < pMesh->mNumFaces; a++) {
@@ -329,37 +258,6 @@ int JoinVerticesProcess::ProcessMesh( aiMesh* pMesh, unsigned int meshIndex) {
         }
     }
 
-    // adjust bone vertex weights.
-    for( int a = 0; a < (int)pMesh->mNumBones; a++) {
-        aiBone* bone = pMesh->mBones[a];
-        std::vector<aiVertexWeight> newWeights;
-        newWeights.reserve( bone->mNumWeights);
-
-        if (nullptr != bone->mWeights) {
-            for ( unsigned int b = 0; b < bone->mNumWeights; b++ ) {
-                const aiVertexWeight& ow = bone->mWeights[ b ];
-                // if the vertex is a unique one, translate it
-				// filter out joined vertices by JOINED_VERTICES_MARK.
-                if ( !( replaceIndex[ ow.mVertexId ] & JOINED_VERTICES_MARK ) ) {
-                    aiVertexWeight nw;
-                    nw.mVertexId = replaceIndex[ ow.mVertexId ];
-                    nw.mWeight = ow.mWeight;
-                    newWeights.push_back( nw );
-                }
-            }
-        } else {
-            ASSIMP_LOG_ERROR( "X-Export: aiBone shall contain weights, but pointer to them is nullptr." );
-        }
-
-        if (newWeights.size() > 0) {
-            // kill the old and replace them with the translated weights
-            delete [] bone->mWeights;
-            bone->mNumWeights = (unsigned int)newWeights.size();
-
-            bone->mWeights = new aiVertexWeight[bone->mNumWeights];
-            memcpy( bone->mWeights, &newWeights[0], bone->mNumWeights * sizeof( aiVertexWeight));
-        }
-    }
     return pMesh->mNumVertices;
 }
 

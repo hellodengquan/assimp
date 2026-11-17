@@ -65,7 +65,7 @@ namespace Assimp {
  * The step has been added because it was required by the viewer, however
  * it has been moved to the main library since others might find it
  * useful, too. */
-class ASSIMP_API_WINONLY MakeVerboseFormatProcess : public BaseProcess {
+class ASSIMP_API MakeVerboseFormatProcess : public BaseProcess {
 public:
     // -------------------------------------------------------------------
     /// The default class constructor / destructor.

@@ -140,3 +140,87 @@ TEST_F(utJoinVertices, testProcess) {
     }
     EXPECT_EQ(150.f * 299.f * 3.f, fSum); // gaussian sum equation
 }
+
+// ------------------------------------------------------------------------------------------------
+// Joining vertices removes duplicates from every vertex stream. Bone weights
+// and morph targets must follow the surviving vertices instead of keeping
+// stale indices.
+TEST_F(utJoinVertices, joinsBonesAndMorphTargets) {
+    aiMesh *mesh = new aiMesh();
+
+    // vertices 0 and 2 are identical; vertex 1 is distinct
+    mesh->mNumVertices = 3;
+    mesh->mVertices = new aiVector3D[3];
+    mesh->mVertices[0] = aiVector3D(0, 0, 0);
+    mesh->mVertices[1] = aiVector3D(1, 0, 0);
+    mesh->mVertices[2] = aiVector3D(0, 0, 0);
+
+    mesh->mTextureCoords[0] = new aiVector3D[3];
+    mesh->mTextureCoords[3] = new aiVector3D[3]; // sparse channel
+    mesh->mColors[0] = new aiColor4D[3];
+    for (unsigned int i = 0; i < 3; ++i) {
+        mesh->mTextureCoords[0][i] = aiVector3D(0, 0, 0);
+        mesh->mTextureCoords[3][i] = aiVector3D(static_cast<ai_real>(i), 0, 0);
+        mesh->mColors[0][i] = aiColor4D(0, 0, 0, 1);
+    }
+
+    mesh->mNumBones = 1;
+    mesh->mBones = new aiBone *[1];
+    aiBone *bone = mesh->mBones[0] = new aiBone();
+    bone->mWeights = new aiVertexWeight[3];
+    bone->mNumWeights = 3;
+    bone->mWeights[0] = aiVertexWeight(0, 0.5f);
+    bone->mWeights[1] = aiVertexWeight(1, 0.25f);
+    bone->mWeights[2] = aiVertexWeight(2, 0.25f);
+
+    mesh->mNumAnimMeshes = 1;
+    mesh->mAnimMeshes = new aiAnimMesh *[1];
+    aiAnimMesh *anim = mesh->mAnimMeshes[0] = new aiAnimMesh();
+    anim->mNumVertices = 3;
+    anim->mVertices = new aiVector3D[3];
+    anim->mTextureCoords[3] = new aiVector3D[3];
+    for (unsigned int i = 0; i < 3; ++i) {
+        anim->mVertices[i] = mesh->mVertices[i];
+        anim->mTextureCoords[3][i] = mesh->mTextureCoords[3][i];
+    }
+
+    mesh->mNumFaces = 1;
+    mesh->mFaces = new aiFace[1];
+    mesh->mFaces[0].mNumIndices = 3;
+    mesh->mFaces[0].mIndices = new unsigned int[3]{ 0, 1, 2 };
+
+    piProcess->ProcessMesh(mesh, 0);
+
+    // vertices 0 and 2 collapse
+    ASSERT_EQ(2u, mesh->mNumVertices);
+    EXPECT_EQ(2u, mesh->mAnimMeshes[0]->mNumVertices);
+
+    // every face index must be in range and the surviving vertices must keep
+    // their attributes
+    for (unsigned int i = 0; i < mesh->mFaces[0].mNumIndices; ++i) {
+        EXPECT_LT(mesh->mFaces[0].mIndices[i], mesh->mNumVertices);
+    }
+    EXPECT_EQ(aiVector3D(1, 0, 0), mesh->mVertices[1]);
+    EXPECT_EQ(aiVector3D(0, 0, 0), mesh->mVertices[0]);
+    EXPECT_EQ(aiVector3D(1, 0, 0), mesh->mTextureCoords[3][1]);
+    EXPECT_EQ(nullptr, mesh->mTextureCoords[1]);
+    EXPECT_EQ(nullptr, mesh->mTextureCoords[2]);
+
+    // The bone must only reference surviving vertices. The duplicate copy's
+    // weight must not be accumulated onto the survivor.
+    ASSERT_EQ(1u, mesh->mNumBones);
+    float sum = 0.f;
+    for (unsigned int w = 0; w < mesh->mBones[0]->mNumWeights; ++w) {
+        const aiVertexWeight &vw = mesh->mBones[0]->mWeights[w];
+        EXPECT_LT(vw.mVertexId, mesh->mNumVertices);
+        sum += vw.mWeight;
+    }
+    EXPECT_FLOAT_EQ(0.75f, sum);
+
+    // morph target data must match the joined positions
+    EXPECT_EQ(aiVector3D(1, 0, 0), mesh->mAnimMeshes[0]->mVertices[1]);
+    EXPECT_EQ(aiVector3D(1, 0, 0), mesh->mAnimMeshes[0]->mTextureCoords[3][1]);
+    EXPECT_EQ(nullptr, mesh->mAnimMeshes[0]->mTextureCoords[0]);
+
+    delete mesh;
+}

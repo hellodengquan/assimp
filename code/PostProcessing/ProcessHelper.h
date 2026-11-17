@@ -54,6 +54,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/SpatialSort.h>
 
 #include <list>
+#include <vector>
 
 // -------------------------------------------------------------------------------
 // Some extensions to std namespace. Mainly std::min and std::max for all
@@ -328,7 +329,88 @@ const char *MappingTypeToString(aiTextureMapping in);
 
 // -------------------------------------------------------------------------------
 // Split a mesh given a list of faces to be contained in the sub mesh
-aiMesh *MakeSubmesh(const aiMesh *superMesh, const std::vector<unsigned int> &subMeshFaces, unsigned int subFlags);
+ASSIMP_API aiMesh *MakeSubmesh(const aiMesh *superMesh, const std::vector<unsigned int> &subMeshFaces, unsigned int subFlags);
+
+// -------------------------------------------------------------------------------
+/** @brief Describes a new vertex ordering for an #aiMesh.
+ *
+ *  The reordering is expressed as a mapping from the new vertex index to the
+ *  index of the source vertex it was taken from. Vertex-duplicating steps
+ *  (face normal generation, verbose conversion, mesh splitting) list the same
+ *  source index several times; vertex-deduplicating steps
+ *  (JoinIdenticalVertices) leave out the indices of merged vertices.
+ *
+ *  The remap knows which per-vertex data belongs together, so a step only has
+ *  to describe the reordering once and can then remap the positions, every
+ *  other vertex stream, all morph targets (#aiAnimMesh) and the bone weights
+ *  with it. Streams that are not present in the source data stay absent, and
+ *  per-channel data such as #aiMesh::mNumUVComponents is not touched.
+ */
+class ASSIMP_API MeshVertexRemap {
+public:
+    MeshVertexRemap() = default;
+
+    /// @param oldVertexCount Number of vertices in the source mesh.
+    /// @param newToOld New index -> source index. Entries that point outside
+    ///        the source range are filled with default values and ignored when
+    ///        bone weights are remapped.
+    ///
+    /// The mapping may be non-injective. Every result vertex inherits the
+    /// weights of the source vertex it was taken from, so duplicating a source
+    /// vertex gives each copy the same influences, while source vertices that
+    /// no result vertex refers to lose their weights.
+    MeshVertexRemap(unsigned int oldVertexCount, std::vector<unsigned int> newToOld);
+
+    /// Number of vertices in the source mesh.
+    unsigned int OldVertexCount() const { return mOldVertexCount; }
+
+    /// Number of vertices after the remap.
+    unsigned int NewVertexCount() const { return static_cast<unsigned int>(mNewToOld.size()); }
+
+    /// True if the mapping leaves every vertex in place.
+    bool IsIdentity() const { return mIsIdentity; }
+
+    /// Remap an existing mesh in place.
+    ///
+    /// Rewrites all per-vertex streams (positions, normals, tangents,
+    /// bitangents and every non-null UV and color channel), the attached anim
+    /// meshes and the bone weights. Streams that were absent stay absent.
+    void ApplyInPlace(aiMesh *mesh) const;
+
+    /// Copy the per-vertex data of @p src to the freshly created @p dest and
+    /// remap it.
+    ///
+    /// Copies positions, normals, tangents, bitangents, every non-null UV and
+    /// color channel, the per-channel UV metadata, the morphing method, the
+    /// anim meshes and (unless @p copyBones is false) the bone weights. Name,
+    /// material index, primitive types, faces and bounding box are left to the
+    /// caller.
+    void CopyTo(aiMesh *dest, const aiMesh *src, bool copyBones = true) const;
+
+    /// Copy and remap the morph targets of @p src into @p dest.
+    ///
+    /// Use this from steps that build the output mesh themselves but still
+    /// want the morph targets of the source mesh to follow the vertex
+    /// reordering. Any anim meshes already present in @p dest are replaced.
+    void CopyAnimMeshesTo(aiMesh *dest, const aiMesh *src) const;
+
+private:
+    void RemapVertexStreamsInPlace(aiMesh *mesh) const;
+    void RemapAnimMeshInPlace(aiAnimMesh *animMesh) const;
+    void RemapBonesInPlace(aiMesh *mesh) const;
+    void CopyVertexStreams(aiMesh *dest, const aiMesh *src) const;
+    void CopyBones(aiMesh *dest, const aiMesh *src) const;
+    void CopyAnimMeshes(aiMesh *dest, const aiMesh *src) const;
+
+    unsigned int mOldVertexCount = 0;
+    bool mIsIdentity = true;
+    std::vector<unsigned int> mNewToOld;
+    std::vector<bool> mNewToOldValid;
+
+    // CSR mapping old index -> list of new indices.
+    std::vector<unsigned int> mOldToNewStart;
+    std::vector<unsigned int> mOldToNewIndices;
+};
 
 // -------------------------------------------------------------------------------
 // Utility post-process step to share the spatial sort tree between

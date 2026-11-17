@@ -209,3 +209,57 @@ TEST_F(SortByPTypeProcessTest, issue389327770Test) {
     const aiScene *scene = importer.ReadFile(ASSIMP_TEST_MODELS_DIR "/fuzzer_data/clusterfuzz-testcase-minimized-assimp_fuzzer-4751812606885888", aiProcessPreset_TargetRealtime_Fast);
     EXPECT_NE(nullptr, scene);
 }
+
+// ------------------------------------------------------------------------------------------------
+// A mesh may store UV and color channels out of order (e.g. channel 0 missing,
+// channel 1 present). Splitting by primitive type must copy every populated
+// channel, not stop at the first empty one.
+TEST_F(SortByPTypeProcessTest, copiesSparseAttributeChannels) {
+    aiScene *scene = new aiScene();
+    scene->mNumMeshes = 1;
+    scene->mMeshes = new aiMesh *[1]();
+    scene->mRootNode = new aiNode();
+    scene->mRootNode->mNumMeshes = 1;
+    scene->mRootNode->mMeshes = new unsigned int[1]{ 0 };
+
+    aiMesh *mesh = scene->mMeshes[0] = new aiMesh();
+    mesh->mNumVertices = 6;
+    mesh->mVertices = new aiVector3D[6];
+    mesh->mTextureCoords[1] = new aiVector3D[6]; // sparse: channel 0 is absent
+    mesh->mColors[2] = new aiColor4D[6]; // sparse: channels 0 and 1 are absent
+    mesh->mNumUVComponents[1] = 3;
+
+    for (unsigned int i = 0; i < 6; ++i) {
+        mesh->mVertices[i] = aiVector3D(static_cast<ai_real>(i), 0, 0);
+        mesh->mTextureCoords[1][i] = aiVector3D(static_cast<ai_real>(i) + 10, 0, 0);
+        mesh->mColors[2][i] = aiColor4D(static_cast<ai_real>(i) + 20, 0, 0, 1);
+    }
+
+    // one triangle and one line, so the mesh is split into two
+    mesh->mNumFaces = 2;
+    mesh->mFaces = new aiFace[2];
+    mesh->mFaces[0].mNumIndices = 3;
+    mesh->mFaces[0].mIndices = new unsigned int[3]{ 0, 1, 2 };
+    mesh->mFaces[1].mNumIndices = 2;
+    mesh->mFaces[1].mIndices = new unsigned int[2]{ 3, 4 };
+    mesh->mPrimitiveTypes = aiPrimitiveType_TRIANGLE | aiPrimitiveType_LINE;
+
+    mProcess1->Execute(scene);
+
+    ASSERT_EQ(2u, scene->mNumMeshes);
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        const aiMesh *out = scene->mMeshes[m];
+        ASSERT_NE(nullptr, out);
+        EXPECT_NE(nullptr, out->mTextureCoords[1]);
+        EXPECT_NE(nullptr, out->mColors[2]);
+        EXPECT_EQ(3u, out->mNumUVComponents[1]);
+
+        for (unsigned int i = 0; i < out->mNumVertices; ++i) {
+            const ai_real p = out->mVertices[i].x;
+            EXPECT_EQ(aiVector3D(p + 10, 0, 0), out->mTextureCoords[1][i]);
+            EXPECT_EQ(aiColor4D(p + 20, 0, 0, 1), out->mColors[2][i]);
+        }
+    }
+
+    delete scene;
+}

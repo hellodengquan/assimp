@@ -52,7 +52,7 @@ namespace Assimp {
 /**
  * @brief The GenFaceNormalsProcess computes face normals for all faces of all meshes
  */
-class ASSIMP_API_WINONLY GenFaceNormalsProcess : public BaseProcess {
+class ASSIMP_API GenFaceNormalsProcess : public BaseProcess {
 public:
     // -------------------------------------------------------------------
     /// The default class constructor / destructor.

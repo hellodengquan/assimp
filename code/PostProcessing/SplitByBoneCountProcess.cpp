@@ -44,6 +44,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 // internal headers of the post-processing framework
 #include "SplitByBoneCountProcess.h"
+#include "ProcessHelper.h"
 #include <assimp/postprocess.h>
 #include <assimp/DefaultLogger.hpp>
 
@@ -219,6 +220,7 @@ void SplitByBoneCountProcess::SplitMesh( const aiMesh* pMesh, std::vector<aiMesh
         }
         newMesh->mMaterialIndex = pMesh->mMaterialIndex;
         newMesh->mPrimitiveTypes = pMesh->mPrimitiveTypes;
+        newMesh->mMethod = pMesh->mMethod;
         poNewMeshes.emplace_back( newMesh);
 
         // create all the arrays for this mesh if the old mesh contained them
@@ -349,41 +351,12 @@ void SplitByBoneCountProcess::SplitMesh( const aiMesh* pMesh, std::vector<aiMesh
 
         // ... and copy all the morph targets for all the vertices which made it into the new submesh
         if (pMesh->mNumAnimMeshes > 0) {
-            newMesh->mNumAnimMeshes = pMesh->mNumAnimMeshes;
-            newMesh->mAnimMeshes = new aiAnimMesh*[newMesh->mNumAnimMeshes];
-
-            for (unsigned int morphIdx = 0; morphIdx < newMesh->mNumAnimMeshes; ++morphIdx) {
-                aiAnimMesh* origTarget = pMesh->mAnimMeshes[morphIdx];
-                aiAnimMesh* newTarget = new aiAnimMesh;
-                newTarget->mName = origTarget->mName;
-                newTarget->mWeight = origTarget->mWeight;
-                newTarget->mNumVertices = numSubMeshVertices;
-                newTarget->mVertices = new aiVector3D[numSubMeshVertices];
-                newMesh->mAnimMeshes[morphIdx] = newTarget;
-
-                if (origTarget->HasNormals()) {
-                    newTarget->mNormals = new aiVector3D[numSubMeshVertices];
-                }
-
-                if (origTarget->HasTangentsAndBitangents()) {
-                    newTarget->mTangents = new aiVector3D[numSubMeshVertices];
-                    newTarget->mBitangents = new aiVector3D[numSubMeshVertices];
-                }
-
-                for( unsigned int vi = 0; vi < numSubMeshVertices; ++vi) {
-                    // find the source vertex for it in the source mesh
-                    unsigned int previousIndex = previousVertexIndices[vi];
-                    newTarget->mVertices[vi] = origTarget->mVertices[previousIndex];
-
-                    if (newTarget->HasNormals()) {
-                        newTarget->mNormals[vi] = origTarget->mNormals[previousIndex];
-                    }
-                    if (newTarget->HasTangentsAndBitangents()) {
-                        newTarget->mTangents[vi] = origTarget->mTangents[previousIndex];
-                        newTarget->mBitangents[vi] = origTarget->mBitangents[previousIndex];
-                    }
-                }
-            }
+            // Every output vertex has copies of the source vertex attributes,
+            // so remap the morph targets with the same new -> source mapping
+            // that was used for the base mesh (including every UV and color
+            // channel, not just the first ones).
+            const MeshVertexRemap remap(pMesh->mNumVertices, previousVertexIndices);
+            remap.CopyAnimMeshesTo(newMesh, pMesh);
         }
 
         // I have the strange feeling that this will break apart at some point in time...

@@ -216,6 +216,7 @@ void SortByPTypeProcess::Execute(aiScene *pScene) {
             // copy data members
             out->mPrimitiveTypes = 1u << real;
             out->mMaterialIndex = mesh->mMaterialIndex;
+            out->mMethod = mesh->mMethod;
 
             // allocate output storage
             out->mNumFaces = aiNumPerPType[real];
@@ -259,39 +260,43 @@ void SortByPTypeProcess::Execute(aiScene *pScene) {
             if (mesh->mNumAnimMeshes > 0 && mesh->mAnimMeshes) {
                 out->mNumAnimMeshes = mesh->mNumAnimMeshes;
                 out->mAnimMeshes = new aiAnimMesh *[out->mNumAnimMeshes];
-            }
-
-            for (unsigned int j = 0; j < mesh->mNumAnimMeshes; ++j) {
-                aiAnimMesh *animMesh = mesh->mAnimMeshes[j];
-                aiAnimMesh *outAnimMesh = out->mAnimMeshes[j] = new aiAnimMesh;
-                outAnimMesh->mNumVertices = out->mNumVertices;
-                if (animMesh->mVertices)
-                    outAnimMesh->mVertices = new aiVector3D[out->mNumVertices];
-                else
-                    outAnimMesh->mVertices = nullptr;
-                if (animMesh->mNormals)
-                    outAnimMesh->mNormals = new aiVector3D[out->mNumVertices];
-                else
-                    outAnimMesh->mNormals = nullptr;
-                if (animMesh->mTangents)
-                    outAnimMesh->mTangents = new aiVector3D[out->mNumVertices];
-                else
-                    outAnimMesh->mTangents = nullptr;
-                if (animMesh->mBitangents)
-                    outAnimMesh->mBitangents = new aiVector3D[out->mNumVertices];
-                else
-                    outAnimMesh->mBitangents = nullptr;
-                for (int jj = 0; jj < AI_MAX_NUMBER_OF_COLOR_SETS; ++jj) {
-                    if (animMesh->mColors[jj])
-                        outAnimMesh->mColors[jj] = new aiColor4D[out->mNumVertices];
+                for (unsigned int j = 0; j < mesh->mNumAnimMeshes; ++j) {
+                    aiAnimMesh *animMesh = mesh->mAnimMeshes[j];
+                    aiAnimMesh *outAnimMesh = out->mAnimMeshes[j] = new aiAnimMesh;
+                    outAnimMesh->mNumVertices = out->mNumVertices;
+                    if (animMesh == nullptr) {
+                        // Keep the slot so the morph target order is preserved.
+                        outAnimMesh->mNumVertices = 0;
+                        continue;
+                    }
+                    if (animMesh->mVertices)
+                        outAnimMesh->mVertices = new aiVector3D[out->mNumVertices];
                     else
-                        outAnimMesh->mColors[jj] = nullptr;
-                }
-                for (int jj = 0; jj < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++jj) {
-                    if (animMesh->mTextureCoords[jj])
-                        outAnimMesh->mTextureCoords[jj] = new aiVector3D[out->mNumVertices];
+                        outAnimMesh->mVertices = nullptr;
+                    if (animMesh->mNormals)
+                        outAnimMesh->mNormals = new aiVector3D[out->mNumVertices];
                     else
-                        outAnimMesh->mTextureCoords[jj] = nullptr;
+                        outAnimMesh->mNormals = nullptr;
+                    if (animMesh->mTangents)
+                        outAnimMesh->mTangents = new aiVector3D[out->mNumVertices];
+                    else
+                        outAnimMesh->mTangents = nullptr;
+                    if (animMesh->mBitangents)
+                        outAnimMesh->mBitangents = new aiVector3D[out->mNumVertices];
+                    else
+                        outAnimMesh->mBitangents = nullptr;
+                    for (int jj = 0; jj < AI_MAX_NUMBER_OF_COLOR_SETS; ++jj) {
+                        if (animMesh->mColors[jj])
+                            outAnimMesh->mColors[jj] = new aiColor4D[out->mNumVertices];
+                        else
+                            outAnimMesh->mColors[jj] = nullptr;
+                    }
+                    for (int jj = 0; jj < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++jj) {
+                        if (animMesh->mTextureCoords[jj])
+                            outAnimMesh->mTextureCoords[jj] = new aiVector3D[out->mNumVertices];
+                        else
+                            outAnimMesh->mTextureCoords[jj] = nullptr;
+                    }
                 }
             }
 
@@ -337,20 +342,21 @@ void SortByPTypeProcess::Execute(aiScene *pScene) {
                     }
 
                     for (unsigned int pp = 0; pp < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++pp) {
-                        if (!uv[pp])
-                            break;
-                        *uv[pp]++ = mesh->mTextureCoords[pp][idx];
+                        if (uv[pp])
+                            *uv[pp]++ = mesh->mTextureCoords[pp][idx];
                     }
 
                     for (unsigned int pp = 0; pp < AI_MAX_NUMBER_OF_COLOR_SETS; ++pp) {
-                        if (!cols[pp])
-                            break;
-                        *cols[pp]++ = mesh->mColors[pp][idx];
+                        if (cols[pp])
+                            *cols[pp]++ = mesh->mColors[pp][idx];
                     }
 
                     unsigned int pp = 0;
                     for (; pp < mesh->mNumAnimMeshes; ++pp) {
                         aiAnimMesh *animMesh = mesh->mAnimMeshes[pp];
+                        if (animMesh == nullptr) {
+                            continue;
+                        }
                         aiAnimMesh *outAnimMesh = out->mAnimMeshes[pp];
                         if (animMesh->mVertices)
                             outAnimMesh->mVertices[amIdx] = animMesh->mVertices[idx];

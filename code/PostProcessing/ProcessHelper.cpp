@@ -44,9 +44,377 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "ProcessHelper.h"
 
+#include <algorithm>
 #include <limits>
+#include <memory>
 
 namespace Assimp {
+
+namespace {
+
+// -------------------------------------------------------------------------------
+// Rebuild a per-vertex array in place using a new-index -> source-index mapping.
+// Entries whose source index is out of range are filled with a default value.
+template <typename T>
+void RemapArrayInPlace(T *&data, unsigned int sourceCount,
+        const std::vector<unsigned int> &newToOld, const std::vector<bool> &newToOldValid) {
+    if (data == nullptr) {
+        return;
+    }
+
+    std::unique_ptr<T[]> old(data);
+    T *remapped = new T[newToOld.size()];
+    for (size_t i = 0; i < newToOld.size(); ++i) {
+        if (newToOldValid[i] && newToOld[i] < sourceCount) {
+            remapped[i] = old[newToOld[i]];
+        } else {
+            remapped[i] = T();
+        }
+    }
+    data = remapped;
+}
+
+// -------------------------------------------------------------------------------
+// Create a remapped copy of a per-vertex array. A missing source stream stays
+// missing.
+template <typename T>
+void CopyRemappedArray(T *&dest, const T *src, unsigned int sourceCount,
+        const std::vector<unsigned int> &newToOld, const std::vector<bool> &newToOldValid) {
+    dest = nullptr;
+    if (src == nullptr) {
+        return;
+    }
+
+    T *remapped = new T[newToOld.size()];
+    for (size_t i = 0; i < newToOld.size(); ++i) {
+        if (newToOldValid[i] && newToOld[i] < sourceCount) {
+            remapped[i] = src[newToOld[i]];
+        } else {
+            remapped[i] = T();
+        }
+    }
+    dest = remapped;
+}
+
+// -------------------------------------------------------------------------------
+// Expand the weights of a single bone so that every copy of a source vertex
+// created by the remap receives the influence. The relative order of the source
+// weights is preserved, and the copies of one source vertex are emitted in
+// ascending new-index order.
+void ExpandBoneWeights(const aiBone *src, std::vector<aiVertexWeight> &out,
+        unsigned int oldVertexCount,
+        const std::vector<unsigned int> &oldToNewStart,
+        const std::vector<unsigned int> &oldToNewIndices) {
+    out.clear();
+    if (src == nullptr || src->mWeights == nullptr) {
+        return;
+    }
+
+    out.reserve(src->mNumWeights);
+    for (unsigned int w = 0; w < src->mNumWeights; ++w) {
+        const unsigned int oldId = src->mWeights[w].mVertexId;
+        if (oldId >= oldVertexCount) {
+            ASSIMP_LOG_WARN("MeshVertexRemap: bone weight references vertex ", oldId,
+                    " but the mesh only has ", oldVertexCount, " vertices; weight dropped.");
+            continue;
+        }
+        for (unsigned int k = oldToNewStart[oldId]; k < oldToNewStart[oldId + 1]; ++k) {
+            out.emplace_back(oldToNewIndices[k], src->mWeights[w].mWeight);
+        }
+    }
+}
+
+} // namespace
+
+// -------------------------------------------------------------------------------
+MeshVertexRemap::MeshVertexRemap(unsigned int oldVertexCount, std::vector<unsigned int> newToOld) :
+        mOldVertexCount(oldVertexCount),
+        mNewToOld(std::move(newToOld)) {
+    mNewToOldValid.resize(mNewToOld.size());
+    mIsIdentity = mNewToOld.size() == mOldVertexCount;
+    for (size_t i = 0; i < mNewToOld.size(); ++i) {
+        const bool valid = mNewToOld[i] < mOldVertexCount;
+        mNewToOldValid[i] = valid;
+        if (!valid || mNewToOld[i] != i) {
+            mIsIdentity = false;
+        }
+    }
+
+    // Build an old-index -> new-indices list as CSR so that bone weights can
+    // be expanded without scanning the whole mapping for every weight.
+    mOldToNewStart.assign(static_cast<size_t>(mOldVertexCount) + 1, 0);
+    size_t validCount = 0;
+    for (size_t i = 0; i < mNewToOld.size(); ++i) {
+        if (mNewToOldValid[i]) {
+            ++mOldToNewStart[mNewToOld[i] + 1];
+            ++validCount;
+        }
+    }
+    for (unsigned int i = 0; i < mOldVertexCount; ++i) {
+        mOldToNewStart[i + 1] += mOldToNewStart[i];
+    }
+
+    mOldToNewIndices.resize(validCount);
+    std::vector<unsigned int> cursor(mOldToNewStart.begin(), mOldToNewStart.end() - 1);
+    for (size_t i = 0; i < mNewToOld.size(); ++i) {
+        if (mNewToOldValid[i]) {
+            mOldToNewIndices[cursor[mNewToOld[i]]++] = static_cast<unsigned int>(i);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------
+void MeshVertexRemap::ApplyInPlace(aiMesh *mesh) const {
+    if (mesh == nullptr || mIsIdentity) {
+        return;
+    }
+    if (mesh->mNumVertices != mOldVertexCount) {
+        ASSIMP_LOG_ERROR("MeshVertexRemap: mesh has ", mesh->mNumVertices,
+                " vertices but the remap was built for ", mOldVertexCount, "; skipping remap.");
+        return;
+    }
+
+    RemapVertexStreamsInPlace(mesh);
+
+    for (unsigned int i = 0; i < mesh->mNumAnimMeshes; ++i) {
+        RemapAnimMeshInPlace(mesh->mAnimMeshes[i]);
+    }
+
+    RemapBonesInPlace(mesh);
+    mesh->mNumVertices = NewVertexCount();
+}
+
+// -------------------------------------------------------------------------------
+void MeshVertexRemap::RemapVertexStreamsInPlace(aiMesh *mesh) const {
+    RemapArrayInPlace(mesh->mVertices, mOldVertexCount, mNewToOld, mNewToOldValid);
+    RemapArrayInPlace(mesh->mNormals, mOldVertexCount, mNewToOld, mNewToOldValid);
+    RemapArrayInPlace(mesh->mTangents, mOldVertexCount, mNewToOld, mNewToOldValid);
+    RemapArrayInPlace(mesh->mBitangents, mOldVertexCount, mNewToOld, mNewToOldValid);
+
+    for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_COLOR_SETS; ++i) {
+        RemapArrayInPlace(mesh->mColors[i], mOldVertexCount, mNewToOld, mNewToOldValid);
+    }
+    for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++i) {
+        RemapArrayInPlace(mesh->mTextureCoords[i], mOldVertexCount, mNewToOld, mNewToOldValid);
+    }
+}
+
+// -------------------------------------------------------------------------------
+void MeshVertexRemap::RemapAnimMeshInPlace(aiAnimMesh *animMesh) const {
+    if (animMesh == nullptr) {
+        return;
+    }
+    if (animMesh->mNumVertices != mOldVertexCount) {
+        // A morph target must have exactly one entry per host vertex. Anything
+        // else cannot be mapped without guessing; leave it untouched instead of
+        // indexing out of bounds.
+        ASSIMP_LOG_WARN("MeshVertexRemap: morph target \"", animMesh->mName.C_Str(),
+                "\" has ", animMesh->mNumVertices, " vertices but the mesh has ",
+                mOldVertexCount, "; morph target left untouched.");
+        return;
+    }
+
+    const unsigned int count = animMesh->mNumVertices;
+    RemapArrayInPlace(animMesh->mVertices, count, mNewToOld, mNewToOldValid);
+    RemapArrayInPlace(animMesh->mNormals, count, mNewToOld, mNewToOldValid);
+    RemapArrayInPlace(animMesh->mTangents, count, mNewToOld, mNewToOldValid);
+    RemapArrayInPlace(animMesh->mBitangents, count, mNewToOld, mNewToOldValid);
+
+    for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_COLOR_SETS; ++i) {
+        RemapArrayInPlace(animMesh->mColors[i], count, mNewToOld, mNewToOldValid);
+    }
+    for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++i) {
+        RemapArrayInPlace(animMesh->mTextureCoords[i], count, mNewToOld, mNewToOldValid);
+    }
+
+    animMesh->mNumVertices = NewVertexCount();
+}
+
+// -------------------------------------------------------------------------------
+void MeshVertexRemap::RemapBonesInPlace(aiMesh *mesh) const {
+    if (mesh->mBones == nullptr) {
+        return;
+    }
+
+    std::vector<aiVertexWeight> remappedWeights;
+    for (unsigned int i = 0; i < mesh->mNumBones; ++i) {
+        aiBone *bone = mesh->mBones[i];
+        if (bone == nullptr) {
+            continue;
+        }
+
+        ExpandBoneWeights(bone, remappedWeights, mOldVertexCount, mOldToNewStart, mOldToNewIndices);
+
+        delete[] bone->mWeights;
+        bone->mWeights = nullptr;
+        bone->mNumWeights = static_cast<unsigned int>(remappedWeights.size());
+        if (!remappedWeights.empty()) {
+            bone->mWeights = new aiVertexWeight[remappedWeights.size()];
+            std::copy(remappedWeights.begin(), remappedWeights.end(), bone->mWeights);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------
+void MeshVertexRemap::CopyTo(aiMesh *dest, const aiMesh *src, bool copyBones) const {
+    if (dest == nullptr || src == nullptr) {
+        return;
+    }
+    if (src->mNumVertices != mOldVertexCount) {
+        ASSIMP_LOG_ERROR("MeshVertexRemap: source mesh has ", src->mNumVertices,
+                " vertices but the remap was built for ", mOldVertexCount, "; copying skipped.");
+        return;
+    }
+
+    CopyVertexStreams(dest, src);
+    if (copyBones) {
+        CopyBones(dest, src);
+    } else {
+        dest->mNumBones = 0;
+        dest->mBones = nullptr;
+    }
+    CopyAnimMeshes(dest, src);
+    dest->mMethod = src->mMethod;
+    dest->mNumVertices = NewVertexCount();
+
+    for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++i) {
+        dest->mNumUVComponents[i] = src->mNumUVComponents[i];
+    }
+
+    dest->mTextureCoordsNames = nullptr;
+    if (src->mTextureCoordsNames != nullptr) {
+        dest->mTextureCoordsNames = new aiString *[AI_MAX_NUMBER_OF_TEXTURECOORDS]();
+        for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++i) {
+            if (src->mTextureCoordsNames[i] != nullptr) {
+                dest->mTextureCoordsNames[i] = new aiString(*src->mTextureCoordsNames[i]);
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------
+void MeshVertexRemap::CopyAnimMeshesTo(aiMesh *dest, const aiMesh *src) const {
+    if (dest == nullptr || src == nullptr) {
+        return;
+    }
+    if (src->mNumVertices != mOldVertexCount) {
+        ASSIMP_LOG_ERROR("MeshVertexRemap: source mesh has ", src->mNumVertices,
+                " vertices but the remap was built for ", mOldVertexCount, "; morph targets skipped.");
+        return;
+    }
+    CopyAnimMeshes(dest, src);
+}
+
+// -------------------------------------------------------------------------------
+void MeshVertexRemap::CopyVertexStreams(aiMesh *dest, const aiMesh *src) const {
+    CopyRemappedArray(dest->mVertices, src->mVertices, mOldVertexCount, mNewToOld, mNewToOldValid);
+    CopyRemappedArray(dest->mNormals, src->mNormals, mOldVertexCount, mNewToOld, mNewToOldValid);
+    CopyRemappedArray(dest->mTangents, src->mTangents, mOldVertexCount, mNewToOld, mNewToOldValid);
+    CopyRemappedArray(dest->mBitangents, src->mBitangents, mOldVertexCount, mNewToOld, mNewToOldValid);
+
+    for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_COLOR_SETS; ++i) {
+        CopyRemappedArray(dest->mColors[i], src->mColors[i], mOldVertexCount, mNewToOld, mNewToOldValid);
+    }
+    for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++i) {
+        CopyRemappedArray(dest->mTextureCoords[i], src->mTextureCoords[i], mOldVertexCount, mNewToOld, mNewToOldValid);
+    }
+}
+
+// -------------------------------------------------------------------------------
+void MeshVertexRemap::CopyBones(aiMesh *dest, const aiMesh *src) const {
+    dest->mNumBones = 0;
+    dest->mBones = nullptr;
+    if (src->mBones == nullptr || src->mNumBones == 0) {
+        return;
+    }
+
+    std::vector<aiBone *> bones;
+    bones.reserve(src->mNumBones);
+
+    std::vector<aiVertexWeight> remappedWeights;
+    for (unsigned int i = 0; i < src->mNumBones; ++i) {
+        const aiBone *srcBone = src->mBones[i];
+        if (srcBone == nullptr) {
+            continue;
+        }
+
+        ExpandBoneWeights(srcBone, remappedWeights, mOldVertexCount, mOldToNewStart, mOldToNewIndices);
+        if (remappedWeights.empty()) {
+            // The bone has no influence on any vertex of the result.
+            continue;
+        }
+
+        aiBone *dstBone = new aiBone();
+        dstBone->mName = srcBone->mName;
+        dstBone->mOffsetMatrix = srcBone->mOffsetMatrix;
+        dstBone->mNumWeights = static_cast<unsigned int>(remappedWeights.size());
+        dstBone->mWeights = new aiVertexWeight[dstBone->mNumWeights];
+        std::copy(remappedWeights.begin(), remappedWeights.end(), dstBone->mWeights);
+        bones.push_back(dstBone);
+    }
+
+    if (bones.empty()) {
+        return;
+    }
+
+    dest->mNumBones = static_cast<unsigned int>(bones.size());
+    dest->mBones = new aiBone *[dest->mNumBones];
+    std::copy(bones.begin(), bones.end(), dest->mBones);
+}
+
+// -------------------------------------------------------------------------------
+void MeshVertexRemap::CopyAnimMeshes(aiMesh *dest, const aiMesh *src) const {
+    dest->mNumAnimMeshes = 0;
+    dest->mAnimMeshes = nullptr;
+    if (src->mAnimMeshes == nullptr || src->mNumAnimMeshes == 0) {
+        return;
+    }
+
+    aiAnimMesh **out = new aiAnimMesh *[src->mNumAnimMeshes]();
+    unsigned int outCount = 0;
+    for (unsigned int i = 0; i < src->mNumAnimMeshes; ++i) {
+        const aiAnimMesh *srcAnim = src->mAnimMeshes[i];
+        if (srcAnim == nullptr) {
+            continue;
+        }
+
+        aiAnimMesh *dstAnim = new aiAnimMesh();
+        dstAnim->mName = srcAnim->mName;
+        dstAnim->mWeight = srcAnim->mWeight;
+
+        if (srcAnim->mNumVertices == mOldVertexCount) {
+            const unsigned int count = srcAnim->mNumVertices;
+            CopyRemappedArray(dstAnim->mVertices, srcAnim->mVertices, count, mNewToOld, mNewToOldValid);
+            CopyRemappedArray(dstAnim->mNormals, srcAnim->mNormals, count, mNewToOld, mNewToOldValid);
+            CopyRemappedArray(dstAnim->mTangents, srcAnim->mTangents, count, mNewToOld, mNewToOldValid);
+            CopyRemappedArray(dstAnim->mBitangents, srcAnim->mBitangents, count, mNewToOld, mNewToOldValid);
+            for (unsigned int c = 0; c < AI_MAX_NUMBER_OF_COLOR_SETS; ++c) {
+                CopyRemappedArray(dstAnim->mColors[c], srcAnim->mColors[c], count, mNewToOld, mNewToOldValid);
+            }
+            for (unsigned int c = 0; c < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++c) {
+                CopyRemappedArray(dstAnim->mTextureCoords[c], srcAnim->mTextureCoords[c], count, mNewToOld, mNewToOldValid);
+            }
+            dstAnim->mNumVertices = NewVertexCount();
+        } else {
+            // Mismatched morph target: keep the descriptor but no data rather
+            // than reading out of bounds.
+            ASSIMP_LOG_WARN("MeshVertexRemap: morph target \"", srcAnim->mName.C_Str(),
+                    "\" has ", srcAnim->mNumVertices, " vertices but the mesh has ",
+                    mOldVertexCount, "; morph target data dropped.");
+            dstAnim->mNumVertices = 0;
+        }
+
+        out[outCount++] = dstAnim;
+    }
+
+    if (outCount == 0) {
+        delete[] out;
+        return;
+    }
+
+    dest->mNumAnimMeshes = outCount;
+    dest->mAnimMeshes = out;
+}
 
 // -------------------------------------------------------------------------------
 void ConvertListToStrings(const std::string &in, std::list<std::string> &out) {
@@ -175,7 +543,6 @@ unsigned int GetMeshVFormatUnique(const aiMesh *pcMesh) {
     // tangents and bitangents
     if (pcMesh->HasTangentsAndBitangents()) iRet |= 0x4;
 
-
     static_assert(8 >= AI_MAX_NUMBER_OF_COLOR_SETS, "static_assert(8 >= AI_MAX_NUMBER_OF_COLOR_SETS)");
     static_assert(8 >= AI_MAX_NUMBER_OF_TEXTURECOORDS, "static_assert(8 >= AI_MAX_NUMBER_OF_TEXTURECOORDS)");
 
@@ -241,18 +608,23 @@ aiMesh *MakeSubmesh(const aiMesh *pMesh, const std::vector<unsigned int> &subMes
     aiMesh *oMesh = new aiMesh();
     std::vector<unsigned int> vMap(pMesh->mNumVertices, UINT_MAX);
 
-    size_t numSubVerts = 0;
-    size_t numSubFaces = subMeshFaces.size();
+    const size_t numSubFaces = subMeshFaces.size();
 
-    for (unsigned int i = 0; i < numSubFaces; i++) {
+    // Build the new-index -> source-index mapping used by MeshVertexRemap.
+    std::vector<unsigned int> newToOld;
+
+    for (size_t i = 0; i < numSubFaces; i++) {
         const aiFace &f = pMesh->mFaces[subMeshFaces[i]];
 
         for (unsigned int j = 0; j < f.mNumIndices; j++) {
             if (vMap[f.mIndices[j]] == UINT_MAX) {
-                vMap[f.mIndices[j]] = static_cast<unsigned int>(numSubVerts++);
+                vMap[f.mIndices[j]] = static_cast<unsigned int>(newToOld.size());
+                newToOld.push_back(f.mIndices[j]);
             }
         }
     }
+
+    const size_t numSubVerts = newToOld.size();
 
     oMesh->mName = pMesh->mName;
 
@@ -260,26 +632,17 @@ aiMesh *MakeSubmesh(const aiMesh *pMesh, const std::vector<unsigned int> &subMes
     oMesh->mPrimitiveTypes = pMesh->mPrimitiveTypes;
 
     // create all the arrays for this mesh if the old mesh contained them
+    oMesh->mNumFaces = static_cast<unsigned int>(numSubFaces);
 
-    oMesh->mNumFaces = static_cast<unsigned int>(subMeshFaces.size());
-    oMesh->mNumVertices = static_cast<unsigned int>(numSubVerts);
-    oMesh->mVertices = new aiVector3D[numSubVerts];
-    if (pMesh->HasNormals()) {
-        oMesh->mNormals = new aiVector3D[numSubVerts];
-    }
-
-    if (pMesh->HasTangentsAndBitangents()) {
-        oMesh->mTangents = new aiVector3D[numSubVerts];
-        oMesh->mBitangents = new aiVector3D[numSubVerts];
-    }
-
-    for (size_t a = 0; pMesh->HasTextureCoords(static_cast<unsigned int>(a)); ++a) {
-        oMesh->mTextureCoords[a] = new aiVector3D[numSubVerts];
-        oMesh->mNumUVComponents[a] = pMesh->mNumUVComponents[a];
-    }
-
-    for (size_t a = 0; pMesh->HasVertexColors(static_cast<unsigned int>(a)); ++a) {
-        oMesh->mColors[a] = new aiColor4D[numSubVerts];
+    // copy and remap all per-vertex data, morph targets and bone weights.
+    // Positions used to be allocated unconditionally; keep doing so for callers
+    // that rely on the array being present.
+    const bool copyBones = (~subFlags & AI_SUBMESH_FLAGS_SANS_BONES) != 0;
+    const MeshVertexRemap remap(pMesh->mNumVertices, newToOld);
+    remap.CopyTo(oMesh, pMesh, copyBones);
+    if (pMesh->mVertices == nullptr) {
+        delete[] oMesh->mVertices;
+        oMesh->mVertices = new aiVector3D[numSubVerts]();
     }
 
     // and copy over the data, generating faces with linear indices along the way
@@ -295,84 +658,6 @@ aiMesh *MakeSubmesh(const aiMesh *pMesh, const std::vector<unsigned int> &subMes
         // accumulate linearly all the vertices of the source face
         for (size_t b = 0; b < dstFace.mNumIndices; ++b) {
             dstFace.mIndices[b] = vMap[srcFace.mIndices[b]];
-        }
-    }
-
-    for (unsigned int srcIndex = 0; srcIndex < pMesh->mNumVertices; ++srcIndex) {
-        unsigned int nvi = vMap[srcIndex];
-        if (nvi == UINT_MAX) {
-            continue;
-        }
-
-        oMesh->mVertices[nvi] = pMesh->mVertices[srcIndex];
-        if (pMesh->HasNormals()) {
-            oMesh->mNormals[nvi] = pMesh->mNormals[srcIndex];
-        }
-
-        if (pMesh->HasTangentsAndBitangents()) {
-            oMesh->mTangents[nvi] = pMesh->mTangents[srcIndex];
-            oMesh->mBitangents[nvi] = pMesh->mBitangents[srcIndex];
-        }
-        for (size_t c = 0, cc = pMesh->GetNumUVChannels(); c < cc; ++c) {
-            oMesh->mTextureCoords[c][nvi] = pMesh->mTextureCoords[c][srcIndex];
-        }
-        for (size_t c = 0, cc = pMesh->GetNumColorChannels(); c < cc; ++c) {
-            oMesh->mColors[c][nvi] = pMesh->mColors[c][srcIndex];
-        }
-    }
-
-    if (~subFlags & AI_SUBMESH_FLAGS_SANS_BONES) {
-        std::vector<unsigned int> subBones(pMesh->mNumBones, 0);
-
-        for (unsigned int a = 0; a < pMesh->mNumBones; ++a) {
-            const aiBone *bone = pMesh->mBones[a];
-
-            for (unsigned int b = 0; b < bone->mNumWeights; b++) {
-                unsigned int v = vMap[bone->mWeights[b].mVertexId];
-
-                if (v != UINT_MAX) {
-                    subBones[a]++;
-                }
-            }
-        }
-
-        for (unsigned int a = 0; a < pMesh->mNumBones; ++a) {
-            if (subBones[a] > 0) {
-                oMesh->mNumBones++;
-            }
-        }
-
-        if (oMesh->mNumBones) {
-            oMesh->mBones = new aiBone *[oMesh->mNumBones]();
-            unsigned int nbParanoia = oMesh->mNumBones;
-
-            oMesh->mNumBones = 0; //rewind
-
-            for (unsigned int a = 0; a < pMesh->mNumBones; ++a) {
-                if (subBones[a] == 0) {
-                    continue;
-                }
-                aiBone *newBone = new aiBone;
-                oMesh->mBones[oMesh->mNumBones++] = newBone;
-
-                const aiBone *bone = pMesh->mBones[a];
-
-                newBone->mName = bone->mName;
-                newBone->mOffsetMatrix = bone->mOffsetMatrix;
-                newBone->mWeights = new aiVertexWeight[subBones[a]];
-
-                for (unsigned int b = 0; b < bone->mNumWeights; b++) {
-                    const unsigned int v = vMap[bone->mWeights[b].mVertexId];
-
-                    if (v != UINT_MAX) {
-                        aiVertexWeight w(v, bone->mWeights[b].mWeight);
-                        newBone->mWeights[newBone->mNumWeights++] = w;
-                    }
-                }
-            }
-
-            ai_assert(nbParanoia == oMesh->mNumBones);
-            (void)nbParanoia; // remove compiler warning on release build
         }
     }
 

@@ -203,6 +203,8 @@ SET( POST_PROCESSES
   unit/utImproveCacheLocality.cpp
   unit/utFixInfacingNormals.cpp
   unit/utGenNormals.cpp
+  unit/utMeshVertexRemap.cpp
+  unit/utMakeVerboseFormat.cpp
   unit/utTriangulate.cpp
   unit/utTextureTransform.cpp
   unit/utRemoveRedundantMaterials.cpp
