@@ -52,7 +52,13 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/DefaultLogger.hpp>
 #include <assimp/Importer.hpp>
 #include <assimp/ObjMaterial.h>
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <limits>
 #include <memory>
+#include <unordered_map>
 
 static constexpr aiImporterDesc desc = {
     "Wavefront Object Importer",
@@ -70,6 +76,253 @@ static constexpr aiImporterDesc desc = {
 static constexpr unsigned int ObjMinSize = 16u;
 
 namespace Assimp {
+
+namespace {
+
+// ------------------------------------------------------------------------------------------------
+//  Exact bit pattern of a position, used to look up the direction of valid geometry at the same
+//  location. Comparing bit patterns avoids any epsilon question: the fallback only needs to find
+//  positions that were written from the very same input values.
+struct PositionKey {
+    // Number of 32-bit words needed to hold a position (works for float and double ai_real).
+    static constexpr size_t WordCount = (3 * sizeof(ai_real) + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+    std::array<uint32_t, WordCount> mWords{};
+
+    static PositionKey From(const aiVector3D &v) {
+        PositionKey key;
+        ::memcpy(key.mWords.data(), &v, sizeof(ai_real) * 3);
+        return key;
+    }
+
+    bool operator==(const PositionKey &other) const {
+        return mWords == other.mWords;
+    }
+};
+
+struct PositionKeyHash {
+    size_t operator()(const PositionKey &key) const {
+        // Mix all words; the exact quality does not matter, only the distribution.
+        size_t h = 0;
+        for (uint32_t word : key.mWords) {
+            h = h * 1000003u ^ static_cast<size_t>(word);
+        }
+        return h;
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
+//  Computes an area-weighted face normal using Newell's method. This also gives a sensible
+//  normal for non-planar polygons and returns a zero vector for degenerate faces.
+aiVector3D ComputeFaceNormal(const ObjFile::Face *face, const std::vector<aiVector3D> &positions) {
+    const size_t numCorners = face->mVertices.size();
+    if (numCorners < 3) {
+        return aiVector3D();
+    }
+
+    aiVector3D normal;
+    for (size_t i = 0; i < numCorners; ++i) {
+        const unsigned int current = face->mVertices[i];
+        const unsigned int next = face->mVertices[(i + 1) % numCorners];
+        if (current >= positions.size() || next >= positions.size()) {
+            continue;
+        }
+
+        const aiVector3D &a = positions[current];
+        const aiVector3D &b = positions[next];
+        normal.x += (a.y - b.y) * (a.z + b.z);
+        normal.y += (a.z - b.z) * (a.x + b.x);
+        normal.z += (a.x - b.x) * (a.y + b.y);
+    }
+
+    return normal;
+}
+
+// ------------------------------------------------------------------------------------------------
+//  Generates normals for all face corners without an explicit normal, honouring the smoothing
+//  groups of the OBJ file. The computation is model-wide on purpose: a face keeps its smoothing
+//  relation to neighbouring faces even if the model is split into several meshes (for example
+//  because several materials are used).
+void GenerateSmoothNormals(ObjFile::Model &model) {
+    std::vector<ObjFile::Face *> faces;
+    std::vector<ObjFile::Mesh *> faceMeshes;
+    size_t faceCount = 0;
+    for (ObjFile::Mesh *mesh : model.mMeshes) {
+        if (mesh != nullptr) {
+            faceCount += mesh->mFaces.size();
+        }
+    }
+    faces.reserve(faceCount);
+    faceMeshes.reserve(faceCount);
+
+    // Only polygon and triangle faces carry normals; lines and points do not.
+    auto isSurface = [](const ObjFile::Face *face) {
+        return face->mPrimitiveType == aiPrimitiveType_POLYGON ||
+               face->mPrimitiveType == aiPrimitiveType_TRIANGLE;
+    };
+
+    // A corner needs a generated normal if the file carries smoothing information, or if it
+    // mixes explicit normals with missing ones. Files that provide neither must keep their
+    // historical behaviour (no normals at all).
+    bool hasMissingNormal = false;
+    bool hasExplicitNormal = false;
+    for (ObjFile::Mesh *mesh : model.mMeshes) {
+        if (mesh == nullptr) {
+            continue;
+        }
+        for (ObjFile::Face *face : mesh->mFaces) {
+            if (face == nullptr || !isSurface(face)) {
+                continue;
+            }
+            faces.push_back(face);
+            faceMeshes.push_back(mesh);
+
+            if (face->mNormals.size() != face->mVertices.size()) {
+                // A malformed face dropped some normal slots; treat all of them as missing.
+                hasMissingNormal = true;
+                continue;
+            }
+            for (unsigned int normal : face->mNormals) {
+                if (normal == ObjFile::Face::InvalidIndex) {
+                    hasMissingNormal = true;
+                } else {
+                    hasExplicitNormal = true;
+                }
+            }
+        }
+    }
+
+    if (faces.empty() || !hasMissingNormal || (!model.mHasSmoothingStatement && !hasExplicitNormal)) {
+        return;
+    }
+
+    std::vector<aiVector3D> faceNormals(faces.size());
+    for (size_t i = 0; i < faces.size(); ++i) {
+        faceNormals[i] = ComputeFaceNormal(faces[i], model.mVertices);
+    }
+
+    // Scale for rejecting zero-area faces. Newell's method returns twice the face area.
+    aiVector3D boundsMin(std::numeric_limits<ai_real>::max(), std::numeric_limits<ai_real>::max(), std::numeric_limits<ai_real>::max());
+    aiVector3D boundsMax(std::numeric_limits<ai_real>::lowest(), std::numeric_limits<ai_real>::lowest(), std::numeric_limits<ai_real>::lowest());
+    for (const aiVector3D &v : model.mVertices) {
+        boundsMin.x = std::min(boundsMin.x, v.x);
+        boundsMin.y = std::min(boundsMin.y, v.y);
+        boundsMin.z = std::min(boundsMin.z, v.z);
+        boundsMax.x = std::max(boundsMax.x, v.x);
+        boundsMax.y = std::max(boundsMax.y, v.y);
+        boundsMax.z = std::max(boundsMax.z, v.z);
+    }
+    const ai_real degenerateEpsilon = (boundsMax - boundsMin).Length() * ai_real(1e-6);
+    const ai_real degenerateSquareEpsilon = degenerateEpsilon * degenerateEpsilon;
+
+    // Accumulate the normals of all faces that share a vertex and belong to the same smoothing
+    // group. Vertices are matched by index, not by position, so surfaces that merely coincide in
+    // space without sharing vertices do not influence each other. Degenerate faces are skipped so
+    // that they cannot pollute the normals of their neighbours.
+    std::unordered_map<uint64_t, aiVector3D> accumulated;
+    std::unordered_map<unsigned int, aiVector3D> vertexFallback;
+    std::unordered_map<PositionKey, aiVector3D, PositionKeyHash> positionFallback;
+    accumulated.reserve(faces.size() * 3);
+    vertexFallback.reserve(model.mVertices.size());
+    positionFallback.reserve(model.mVertices.size());
+    aiVector3D modelNormal;
+    bool hasValidFace = false;
+    for (size_t i = 0; i < faces.size(); ++i) {
+        const ObjFile::Face *face = faces[i];
+        if (faceNormals[i].SquareLength() <= degenerateSquareEpsilon) {
+            continue;
+        }
+        hasValidFace = true;
+        modelNormal += faceNormals[i];
+        for (unsigned int vertex : face->mVertices) {
+            // Directions of valid geometry, used as a last resort for degenerate faces.
+            vertexFallback[vertex] += faceNormals[i];
+            if (vertex < model.mVertices.size()) {
+                positionFallback[PositionKey::From(model.mVertices[vertex])] += faceNormals[i];
+            }
+            if (face->mSmoothGroup == 0) {
+                continue;
+            }
+            const uint64_t key = (static_cast<uint64_t>(vertex) << 32) | static_cast<uint64_t>(face->mSmoothGroup);
+            accumulated[key] += faceNormals[i];
+        }
+    }
+    modelNormal.NormalizeSafe();
+
+    if (!hasValidFace) {
+        // Every surface face is degenerate, so there is no meaningful direction at all. Leave
+        // the mesh without generated normals rather than emitting an arbitrary one.
+        return;
+    }
+
+    // Distribute the normals to the face corners. Explicit normals are left untouched, so only
+    // corners that lack one receive generated data.
+    for (size_t i = 0; i < faces.size(); ++i) {
+        ObjFile::Face *face = faces[i];
+        const bool hasExplicitNormals = face->mNormals.size() == face->mVertices.size();
+        const bool faceIsDegenerate = faceNormals[i].SquareLength() <= degenerateSquareEpsilon;
+
+        aiVector3D flatNormal = faceNormals[i];
+        flatNormal.NormalizeSafe();
+
+        bool generated = false;
+        face->mSmoothNormals.assign(face->mVertices.size(), aiVector3D());
+        for (size_t corner = 0; corner < face->mVertices.size(); ++corner) {
+            if (hasExplicitNormals && face->mNormals[corner] != ObjFile::Face::InvalidIndex) {
+                // An explicit normal always wins and is never overwritten.
+                continue;
+            }
+
+            const unsigned int vertex = face->mVertices[corner];
+            aiVector3D normal;
+            if (face->mSmoothGroup != 0) {
+                const uint64_t key = (static_cast<uint64_t>(vertex) << 32) |
+                                     static_cast<uint64_t>(face->mSmoothGroup);
+                auto it = accumulated.find(key);
+                if (it != accumulated.end()) {
+                    normal = it->second;
+                }
+            }
+
+            if (normal.SquareLength() == 0) {
+                if (!faceIsDegenerate) {
+                    // Smoothing disabled, or the group has no usable contribution: use the face
+                    // normal, which also keeps cross-group boundaries sharp.
+                    normal = flatNormal;
+                } else {
+                    // A degenerate face has no normal of its own. Reuse the direction of valid
+                    // geometry at the same vertex or position instead of emitting a zero vector.
+                    auto it = vertexFallback.find(vertex);
+                    if (it != vertexFallback.end()) {
+                        normal = it->second;
+                    } else if (vertex < model.mVertices.size()) {
+                        auto posIt = positionFallback.find(PositionKey::From(model.mVertices[vertex]));
+                        if (posIt != positionFallback.end()) {
+                            normal = posIt->second;
+                        }
+                    }
+                    if (normal.SquareLength() == 0) {
+                        // Nothing touches this vertex: use the average direction of the valid
+                        // geometry so the array stays free of zero-length normals.
+                        normal = modelNormal;
+                    }
+                }
+            }
+
+            normal.NormalizeSafe();
+            face->mSmoothNormals[corner] = normal;
+            generated = true;
+        }
+
+        if (generated) {
+            ObjFile::Mesh *mesh = faceMeshes[i];
+            if (mesh != nullptr) {
+                mesh->mHasSmoothNormals = true;
+            }
+        }
+    }
+}
+
+} // namespace
 
 using namespace std;
 
@@ -142,6 +395,10 @@ void ObjFileImporter::InternReadFile(const std::string &file, aiScene *pScene, I
 
     // parse the file into a temporary representation
     ObjFileParser parser(streamedBuffer, modelName, pIOHandler, m_progress, file);
+
+    // Fill in normals for all corners without an explicit one, honouring the smoothing
+    // groups of the file.
+    GenerateSmoothNormals(*parser.GetModel());
 
     // And create the proper return structures out of it
     CreateDataFromImport(parser.GetModel(), pScene);
@@ -423,8 +680,9 @@ void ObjFileImporter::createVertexArray(const ObjFile::Model *model, const ObjFi
 
     mesh->mVertices = new aiVector3D[mesh->mNumVertices];
 
-    // Allocate buffer for normal vectors
-    if (!model->mNormals.empty() && objMesh->mHasNormals)
+    // Allocate buffer for normal vectors. Generated normals may exist even when the file
+    // contains no explicit `vn` records at all.
+    if (objMesh->mHasNormals || objMesh->mHasSmoothNormals)
         mesh->mNormals = new aiVector3D[mesh->mNumVertices];
 
     // Allocate buffer for vertex-color vectors
@@ -454,14 +712,28 @@ void ObjFileImporter::createVertexArray(const ObjFile::Model *model, const ObjFi
 
             mesh->mVertices[newIndex] = model->mVertices[vertex];
 
-            // Copy all normals
-            if (normalsok && !model->mNormals.empty() && vertexIndex < sourceFace->mNormals.size()) {
-                const unsigned int normal = sourceFace->mNormals[vertexIndex];
-                if (normal >= model->mNormals.size()) {
-                    normalsok = false;
+            // Explicit normals from the file keep their direction; where none is present the
+            // value generated from the smoothing groups (or the per-face fallback) is used.
+            aiVector3D normal;
+            bool hasValue = false;
+            if (sourceFace->mNormals.size() == sourceFace->mVertices.size() &&
+                    sourceFace->mNormals[vertexIndex] != ObjFile::Face::InvalidIndex) {
+                const unsigned int normalIndex = sourceFace->mNormals[vertexIndex];
+                if (!model->mNormals.empty() && normalIndex < model->mNormals.size()) {
+                    normal = model->mNormals[normalIndex];
+                    hasValue = true;
                 } else {
-                    mesh->mNormals[newIndex] = model->mNormals[normal];
+                    normalsok = false;
                 }
+            }
+
+            if (!hasValue && vertexIndex < sourceFace->mSmoothNormals.size()) {
+                normal = sourceFace->mSmoothNormals[vertexIndex];
+                hasValue = true;
+            }
+
+            if (mesh->mNormals != nullptr && normalsok) {
+                mesh->mNormals[newIndex] = hasValue ? normal : aiVector3D();
             }
 
             // Copy all vertex colors
@@ -506,7 +778,7 @@ void ObjFileImporter::createVertexArray(const ObjFile::Model *model, const ObjFi
                         }
 
                         mesh->mVertices[newIndex + 1] = mesh->mVertices[newIndex];
-                        if (!sourceFace->mNormals.empty() && !model->mNormals.empty()) {
+                        if (mesh->mNormals) {
                             mesh->mNormals[newIndex + 1] = mesh->mNormals[newIndex];
                         }
                         if (!model->mTextureCoord.empty()) {

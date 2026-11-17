@@ -582,3 +582,349 @@ TEST_F(utObjImportExport, scientific_notation_underflow_and_zero_mantissa) {
     EXPECT_FLOAT_EQ(0.0f, mesh->mVertices[4].x);
 #endif
 }
+
+namespace {
+
+// Returns true if any vertex of the mesh uses the given normal (within a small tolerance).
+bool MeshHasNormal(const aiMesh *mesh, const aiVector3D &normal) {
+    if (mesh->mNormals == nullptr) {
+        return false;
+    }
+    const ai_real tolerance = ai_real(1e-3);
+    for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
+        if ((mesh->mNormals[i] - normal).SquareLength() <= tolerance * tolerance) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Returns the normal assigned to the given vertex of the given face.
+aiVector3D CornerNormal(const aiMesh *mesh, unsigned int face, unsigned int corner) {
+    return mesh->mNormals[mesh->mFaces[face].mIndices[corner]];
+}
+
+} // namespace
+
+TEST_F(utObjImportExport, smoothingGroup_smoothAcrossSharedEdge) {
+    // Two quads sharing an edge in the same smoothing group: the shared edge must be
+    // smoothed, i.e. the shared vertices get a blended normal.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 0 1\n"
+            "v 0 0 1\n"
+            "v 1 1 1\n"
+            "v 1 1 0\n"
+            "s 1\n"
+            "f 1 2 3 4\n"
+            "f 2 6 5 3\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1, 0);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    const aiMesh *mesh = scene->mMeshes[0];
+    ASSERT_NE(nullptr, mesh->mNormals);
+    ASSERT_EQ(2U, mesh->mNumFaces);
+
+    // The blend of the -Y and +X face normals is (sqrt(0.5), -sqrt(0.5), 0).
+    const ai_real s = static_cast<ai_real>(0.70710678);
+    EXPECT_TRUE(MeshHasNormal(mesh, aiVector3D(s, -s, 0)));
+    EXPECT_TRUE(MeshHasNormal(mesh, aiVector3D(0, -1, 0)));
+    EXPECT_TRUE(MeshHasNormal(mesh, aiVector3D(1, 0, 0)));
+}
+
+TEST_F(utObjImportExport, smoothingGroup_hardEdgeBetweenGroups) {
+    // The same fold, but the two faces belong to different smoothing groups: the shared
+    // vertices must keep the two separate face normals.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 0 1\n"
+            "v 0 0 1\n"
+            "v 1 1 1\n"
+            "v 1 1 0\n"
+            "s 1\n"
+            "f 1 2 3 4\n"
+            "s 2\n"
+            "f 2 6 5 3\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1, 0);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    const aiMesh *mesh = scene->mMeshes[0];
+    ASSERT_NE(nullptr, mesh->mNormals);
+    ASSERT_EQ(2U, mesh->mNumFaces);
+
+    EXPECT_FALSE(MeshHasNormal(mesh, aiVector3D(static_cast<ai_real>(0.70710678), static_cast<ai_real>(-0.70710678), 0)));
+    for (unsigned int corner = 0; corner < mesh->mFaces[0].mNumIndices; ++corner) {
+        EXPECT_NEAR(-1.0, CornerNormal(mesh, 0, corner).y, 1e-4);
+        EXPECT_NEAR(0.0, CornerNormal(mesh, 0, corner).x, 1e-4);
+    }
+    for (unsigned int corner = 0; corner < mesh->mFaces[1].mNumIndices; ++corner) {
+        EXPECT_NEAR(1.0, CornerNormal(mesh, 1, corner).x, 1e-4);
+        EXPECT_NEAR(0.0, CornerNormal(mesh, 1, corner).y, 1e-4);
+    }
+}
+
+TEST_F(utObjImportExport, smoothingGroup_smoothingOffKeepsHardEdges) {
+    // An explicit "s off" means flat shading: the fold stays hard even though both faces
+    // share an edge.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 0 1\n"
+            "v 0 0 1\n"
+            "v 1 1 1\n"
+            "v 1 1 0\n"
+            "s off\n"
+            "f 1 2 3 4\n"
+            "f 2 6 5 3\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1, 0);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    const aiMesh *mesh = scene->mMeshes[0];
+    ASSERT_NE(nullptr, mesh->mNormals);
+
+    EXPECT_FALSE(MeshHasNormal(mesh, aiVector3D(static_cast<ai_real>(0.70710678), static_cast<ai_real>(-0.70710678), 0)));
+    for (unsigned int corner = 0; corner < mesh->mFaces[0].mNumIndices; ++corner) {
+        EXPECT_NEAR(-1.0, CornerNormal(mesh, 0, corner).y, 1e-4);
+    }
+    for (unsigned int corner = 0; corner < mesh->mFaces[1].mNumIndices; ++corner) {
+        EXPECT_NEAR(1.0, CornerNormal(mesh, 1, corner).x, 1e-4);
+    }
+}
+
+TEST_F(utObjImportExport, smoothingGroup_absentKeepsLegacyBehaviour) {
+    // Without any smoothing statement the importer must not invent normals.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 0 1\n"
+            "v 0 0 1\n"
+            "f 1 2 3 4\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1, 0);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    EXPECT_EQ(nullptr, scene->mMeshes[0]->mNormals);
+}
+
+TEST_F(utObjImportExport, smoothingGroup_spansMaterialSplitMeshes) {
+    // Switching materials splits the model into several meshes. The faces still share
+    // their vertices, so the smoothing relation must survive the split.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 0 1\n"
+            "v 0 0 1\n"
+            "v 1 1 1\n"
+            "v 1 1 0\n"
+            "s 1\n"
+            "usemtl mat_a\n"
+            "f 1 2 3 4\n"
+            "usemtl mat_b\n"
+            "f 2 6 5 3\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1, 0);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(2U, scene->mNumMeshes);
+
+    // Both meshes must contain the blended normal for their shared vertices. The shared
+    // vertices are duplicated per mesh, but must carry the same smoothed direction.
+    const ai_real s = static_cast<ai_real>(0.70710678);
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        EXPECT_TRUE(MeshHasNormal(scene->mMeshes[m], aiVector3D(s, -s, 0))) << "mesh " << m;
+    }
+}
+
+TEST_F(utObjImportExport, smoothingGroup_keepsExplicitNormals) {
+    // One face has explicit normals, the other has none. The explicit normals must be
+    // preserved exactly and only the missing ones filled in.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 1 0\n"
+            "v 0 1 0\n"
+            "v 2 0 0\n"
+            "v 2 1 0\n"
+            "vn 0 0 1\n"
+            "s 1\n"
+            "f 1//1 2//1 3//1 4//1\n"
+            "f 2 5 6 3\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1, 0);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    const aiMesh *mesh = scene->mMeshes[0];
+    ASSERT_NE(nullptr, mesh->mNormals);
+
+    for (unsigned int corner = 0; corner < mesh->mFaces[0].mNumIndices; ++corner) {
+        const aiVector3D normal = CornerNormal(mesh, 0, corner);
+        EXPECT_NEAR(0.0, normal.x, 1e-6);
+        EXPECT_NEAR(0.0, normal.y, 1e-6);
+        EXPECT_NEAR(1.0, normal.z, 1e-6);
+    }
+    for (unsigned int corner = 0; corner < mesh->mFaces[1].mNumIndices; ++corner) {
+        const aiVector3D normal = CornerNormal(mesh, 1, corner);
+        EXPECT_NEAR(0.0, normal.x, 1e-4);
+        EXPECT_NEAR(0.0, normal.y, 1e-4);
+        EXPECT_NEAR(1.0, normal.z, 1e-4);
+    }
+}
+
+TEST_F(utObjImportExport, smoothingGroup_uvSeamKeepsFaceCorners) {
+    // A texture seam gives the shared vertices different UVs on each side. Each corner
+    // must keep the UV of its own face while the normal is smoothed.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 0 1\n"
+            "v 0 0 1\n"
+            "vt 0 0\n"
+            "vt 1 0\n"
+            "vt 1 1\n"
+            "vt 0.5 1\n"
+            "vt 0.5 0\n"
+            "s 1\n"
+            "f 1/1 2/2 3/3\n"
+            "f 2/4 3/5 4/1\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1, 0);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    const aiMesh *mesh = scene->mMeshes[0];
+    ASSERT_NE(nullptr, mesh->mTextureCoords[0]);
+
+    const aiVector3D expectedUVs[2][3] = {
+        { aiVector3D(0, 0, 0), aiVector3D(1, 0, 0), aiVector3D(1, 1, 0) },
+        { aiVector3D(0.5f, 1, 0), aiVector3D(0.5f, 0, 0), aiVector3D(0, 0, 0) }
+    };
+    for (unsigned int f = 0; f < 2; ++f) {
+        for (unsigned int corner = 0; corner < 3; ++corner) {
+            const unsigned int vi = mesh->mFaces[f].mIndices[corner];
+            EXPECT_NEAR(expectedUVs[f][corner].x, mesh->mTextureCoords[0][vi].x, 1e-5);
+            EXPECT_NEAR(expectedUVs[f][corner].y, mesh->mTextureCoords[0][vi].y, 1e-5);
+        }
+    }
+}
+
+TEST_F(utObjImportExport, smoothingGroup_coincidentButUnconnectedSurfacesAreIndependent) {
+    // Two quads share a border positionally, but use different vertex indices, so they
+    // are not connected. Each must keep its own flat normal.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 0 1\n"
+            "v 0 0 1\n"
+            "v 1 1 1\n"
+            "v 1 1 0\n"
+            "v 1 0 0\n"
+            "v 1 0 1\n"
+            "v 1 0 1\n"
+            "v 1 0 0\n"
+            "s 1\n"
+            "f 1 2 3 4\n"
+            "f 7 6 5 8\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1, 0);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    const aiMesh *mesh = scene->mMeshes[0];
+    ASSERT_NE(nullptr, mesh->mNormals);
+
+    EXPECT_FALSE(MeshHasNormal(mesh, aiVector3D(static_cast<ai_real>(0.70710678), static_cast<ai_real>(-0.70710678), 0)));
+    for (unsigned int corner = 0; corner < mesh->mFaces[0].mNumIndices; ++corner) {
+        EXPECT_NEAR(-1.0, CornerNormal(mesh, 0, corner).y, 1e-4);
+    }
+    for (unsigned int corner = 0; corner < mesh->mFaces[1].mNumIndices; ++corner) {
+        EXPECT_NEAR(1.0, CornerNormal(mesh, 1, corner).x, 1e-4);
+    }
+}
+
+TEST_F(utObjImportExport, smoothingGroup_degenerateFaceDoesNotPolluteNeighbours) {
+    // The degenerate triangle shares vertices with the valid triangle. It has no normal
+    // of its own, so it must neither receive garbage nor change the valid normal.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 1 0\n"
+            "v 1 0 0\n"
+            "v 0 0 0\n"
+            "s 1\n"
+            "f 1 2 3\n"
+            "f 2 4 5\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1, 0);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    const aiMesh *mesh = scene->mMeshes[0];
+    ASSERT_NE(nullptr, mesh->mNormals);
+
+    for (unsigned int corner = 0; corner < mesh->mFaces[0].mNumIndices; ++corner) {
+        const aiVector3D normal = CornerNormal(mesh, 0, corner);
+        EXPECT_NEAR(0.0, normal.x, 1e-4);
+        EXPECT_NEAR(0.0, normal.y, 1e-4);
+        EXPECT_NEAR(1.0, normal.z, 1e-4);
+    }
+    for (unsigned int corner = 0; corner < mesh->mFaces[1].mNumIndices; ++corner) {
+        // No zero-length normals are emitted for the degenerate face either.
+        EXPECT_GT(mesh->mNormals[mesh->mFaces[1].mIndices[corner]].Length(), ai_real(0.5));
+    }
+}
+
+TEST_F(utObjImportExport, smoothingGroup_fromFile) {
+    // Same fold as smoothingGroup_smoothAcrossSharedEdge, loaded from a file so that the
+    // UVs given per corner are exercised as well.
+    Assimp::Importer importer;
+    const aiScene *scene = importer.ReadFile(ASSIMP_TEST_MODELS_DIR "/OBJ/smoothing_group_fold.obj", aiProcess_ValidateDataStructure);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    const aiMesh *mesh = scene->mMeshes[0];
+    ASSERT_NE(nullptr, mesh->mNormals);
+    ASSERT_EQ(2U, mesh->mNumFaces);
+
+    const ai_real s = static_cast<ai_real>(0.70710678);
+    EXPECT_TRUE(MeshHasNormal(mesh, aiVector3D(s, -s, 0)));
+    EXPECT_TRUE(MeshHasNormal(mesh, aiVector3D(0, -1, 0)));
+    EXPECT_TRUE(MeshHasNormal(mesh, aiVector3D(1, 0, 0)));
+}
+
+TEST_F(utObjImportExport, smoothingGroup_withTriangulateAndJoinVertices) {
+    // Triangulation and vertex joining must preserve the smoothing boundaries and the
+    // face orientation.
+    static constexpr char curObjModel[] =
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 1 0\n"
+            "v 0 1 0\n"
+            "v 0 0 1\n"
+            "v 1 0 1\n"
+            "s 1\n"
+            "f 1 2 3 4\n"
+            "f 2 6 5 1\n";
+
+    Assimp::Importer myImporter;
+    const aiScene *scene = myImporter.ReadFileFromMemory(curObjModel, sizeof(curObjModel) - 1,
+            aiProcess_Triangulate | aiProcess_JoinIdenticalVertices | aiProcess_ValidateDataStructure);
+    ASSERT_NE(nullptr, scene);
+    ASSERT_EQ(1U, scene->mNumMeshes);
+    const aiMesh *mesh = scene->mMeshes[0];
+    ASSERT_NE(nullptr, mesh->mNormals);
+    ASSERT_EQ(4U, mesh->mNumFaces);
+
+    // The +Z facing face and the -Y facing face must each still exist; their shared edge
+    // stays smoothed.
+    EXPECT_TRUE(MeshHasNormal(mesh, aiVector3D(0, 0, 1)));
+    EXPECT_TRUE(MeshHasNormal(mesh, aiVector3D(0, -1, 0)));
+}

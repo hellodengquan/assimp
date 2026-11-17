@@ -1,0 +1,30 @@
+# Smoothing group test fixture.
+#
+# Two quads share the edge spanned by vertices 2 and 3. The left quad lies in the XZ
+# plane (normal -Y), the right quad is folded up by 90 degrees (normal +X).
+#
+#   y
+#   ^    6----5
+#   |    |    |
+#   |    |    |
+#   | 2--3----+
+#   | |  |
+#   +-1--4--------> x / z
+#
+o SmoothFold
+
+v 0 0 0
+v 1 0 0
+v 1 0 1
+v 0 0 1
+v 1 1 1
+v 1 1 0
+
+vt 0 0
+vt 1 0
+vt 1 1
+vt 0 1
+
+s 1
+f 1/1 2/2 3/3 4/4
+f 2/2 6/2 5/3 3/3

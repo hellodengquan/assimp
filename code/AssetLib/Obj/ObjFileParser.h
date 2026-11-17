@@ -115,8 +115,8 @@ protected:
     void getNewMaterial();
     /// Gets the group name from file.
     void getGroupName();
-    /// Gets the group number from file.
-    void skipGroupNumber();
+    /// Gets the smoothing group from file (`s <n>`, `s off`, `s on`).
+    void getSmoothingGroup();
     /// Gets the group number and resolution from file.
     void skipGroupNumberAndResolution();
     /// Reselect an existing group (Wavefront `group` keyword) for late material assignment.

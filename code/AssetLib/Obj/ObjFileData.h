@@ -62,11 +62,16 @@ struct Material;
 struct Face {
     using IndexArray = std::vector<unsigned int>;
 
+    /// @brief  Marker used in #mNormals for face corners without an explicit normal.
+    static constexpr unsigned int InvalidIndex = ~0u;
+
     aiPrimitiveType mPrimitiveType{aiPrimitiveType_TRIANGLE};   ///< Primitive type
     IndexArray mVertices{};                                     ///< Vertex indices
-    IndexArray mNormals{};                                      ///< Normal indices
+    IndexArray mNormals{};                                      ///< Normal indices, aligned with #mVertices
     IndexArray mTextureCoords{};                                ///< Texture coordinates indices
     Material *mMaterial{nullptr};                               ///< Pointer to assigned material
+    unsigned int mSmoothGroup{0};                               ///< Smoothing group, 0 means smoothing is disabled
+    std::vector<aiVector3D> mSmoothNormals{};                   ///< Generated normals for corners without an explicit normal
 
     /// @brief  Default constructor with default primitive type.
     /// @param [in] pt  Primitive type.
@@ -222,6 +227,7 @@ struct Mesh {
     unsigned int mUVCoordinates[AI_MAX_NUMBER_OF_TEXTURECOORDS]{};  ///< Number of UV components
     unsigned int mMaterialIndex{NoMaterial};                        ///< Material index.
     bool mHasNormals{false};                                        ///< True, if normals are stored.
+    bool mHasSmoothNormals{false};                                  ///< True, if normals were generated from smoothing groups.
 
     /// @brief Constructor
     /// @paran [in] name    The mesh name
@@ -260,6 +266,8 @@ struct Model {
     std::string mActiveGroup{};                             ///< Active group
     std::vector<aiVector3D> mTextureCoord{};                ///< Vector with generated texture coordinates
     unsigned int mTextureCoordDim{0};                       ///< Maximum dimension of texture coordinates
+    unsigned int mCurrentSmoothGroup{0};                    ///< Active smoothing group, 0 means smoothing is disabled
+    bool mHasSmoothingStatement{false};                     ///< True if the file contains a smoothing statement (including `s off`)
     Mesh *mCurrentMesh{nullptr};                            ///< Current mesh instance
     std::vector<Mesh *> mMeshes{};                          ///< Vector with stored meshes
     std::unordered_map<std::string, Material*> mMaterialMap{};        ///< Material map

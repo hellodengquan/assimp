@@ -402,9 +402,15 @@ void ObjFileParser::parseFile(IOStreamBuffer<char> &streamBuffer) {
             }
         } break;
 
-        case 's': // Parse group number
+        case 's': // Parse smoothing group
         {
-            skipGroupNumber();
+            // Only the `s` keyword starts with 's' followed by whitespace; other statements
+            // such as `sp`, `step`, `surf`, `shadow_obj` or `stech` must be skipped as before.
+            if ((mDataIt + 1) != mDataItEnd && IsSpaceOrNewLine(*(mDataIt + 1))) {
+                getSmoothingGroup();
+            } else {
+                goto pf_skip_line;
+            }
         } break;
 
         case 'o': // Parse object name
@@ -623,10 +629,18 @@ void ObjFileParser::getFace(aiPrimitiveType type) {
                 // Store parsed index
                 if (0 == iPos) {
                     face->mVertices.push_back(static_cast<unsigned int>(iVal - 1));
+                    // Keep the normal array aligned with the vertex array. Missing normals
+                    // get a marker so that they can be filled in later without touching
+                    // the explicit ones.
+                    face->mNormals.push_back(ObjFile::Face::InvalidIndex);
                 } else if (1 == iPos) {
                     face->mTextureCoords.push_back(static_cast<unsigned int>(iVal - 1));
                 } else if (2 == iPos) {
-                    face->mNormals.push_back(static_cast<unsigned int>(iVal - 1));
+                    if (face->mNormals.size() < face->mVertices.size()) {
+                        face->mNormals.push_back(static_cast<unsigned int>(iVal - 1));
+                    } else if (!face->mNormals.empty()) {
+                        face->mNormals.back() = static_cast<unsigned int>(iVal - 1);
+                    }
                     hasNormal = true;
                 } else {
                     reportErrorTokenInFace();
@@ -635,10 +649,15 @@ void ObjFileParser::getFace(aiPrimitiveType type) {
                 // Store relatively index
                 if (0 == iPos) {
                     face->mVertices.push_back(static_cast<unsigned int>(vSize + iVal));
+                    face->mNormals.push_back(ObjFile::Face::InvalidIndex);
                 } else if (1 == iPos) {
                     face->mTextureCoords.push_back(static_cast<unsigned int>(vtSize + iVal));
                 } else if (2 == iPos) {
-                    face->mNormals.push_back(static_cast<unsigned int>(vnSize + iVal));
+                    if (face->mNormals.size() < face->mVertices.size()) {
+                        face->mNormals.push_back(static_cast<unsigned int>(vnSize + iVal));
+                    } else if (!face->mNormals.empty()) {
+                        face->mNormals.back() = static_cast<unsigned int>(vnSize + iVal);
+                    }
                     hasNormal = true;
                 } else {
                     reportErrorTokenInFace();
@@ -677,6 +696,7 @@ void ObjFileParser::getFace(aiPrimitiveType type) {
     }
 
     // Store the face
+    face->mSmoothGroup = mModel->mCurrentSmoothGroup;
     mModel->mCurrentMesh->mFaces.emplace_back(face);
     mModel->mCurrentMesh->mNumIndices += static_cast<unsigned int>(face->mVertices.size());
     mModel->mCurrentMesh->mUVCoordinates[0] += static_cast<unsigned int>(face->mTextureCoords.size());
@@ -975,8 +995,56 @@ void ObjFileParser::reselectGroup() {
 }
 
 // -------------------------------------------------------------------
-void ObjFileParser::skipGroupNumber() {
-    // Not used
+//  Parses a smoothing group statement (`s <n>`, `s off`, `s on`).
+void ObjFileParser::getSmoothingGroup() {
+    mDataIt = getNextToken<DataArrayIt>(mDataIt, mDataItEnd);
+    if (mDataIt == mDataItEnd) {
+        return;
+    }
+
+    const char *pStart = &(*mDataIt);
+    while (mDataIt != mDataItEnd && !IsSpaceOrNewLine(*mDataIt)) {
+        ++mDataIt;
+    }
+
+    std::string_view svValue(pStart, static_cast<size_t>(&(*mDataIt) - pStart));
+    svValue = trimStringView(svValue);
+
+    unsigned int group = 0;
+    // "off" and "on" are case-insensitive keywords per the OBJ specification.
+    if (svValue.size() == 3 && ASSIMP_strincmp(svValue.data(), "off", 3) == 0) {
+        group = 0;
+    } else if (svValue.size() == 2 && ASSIMP_strincmp(svValue.data(), "on", 2) == 0) {
+        // "s on" enables smoothing without naming a group: use group 1.
+        group = 1;
+    } else if (!svValue.empty()) {
+        // Manually parse the group number. Values that are not a plain decimal number are
+        // ignored, leaving the previously active group in effect.
+        bool valid = true;
+        unsigned long long value = 0;
+        for (char c : svValue) {
+            if (c < '0' || c > '9') {
+                valid = false;
+                break;
+            }
+            // Saturate instead of overflowing. A saturated value still selects a distinct
+            // group, which is all that matters here.
+            value = std::min<unsigned long long>(value * 10ull + static_cast<unsigned long long>(c - '0'),
+                    static_cast<unsigned long long>(std::numeric_limits<unsigned int>::max()));
+        }
+        if (!valid) {
+            ASSIMP_LOG_WARN("OBJ: Invalid smoothing group '", std::string(svValue), "', ignored");
+            mDataIt = skipLine<DataArrayIt>(mDataIt, mDataItEnd, mLine);
+            return;
+        }
+        group = static_cast<unsigned int>(value);
+    } else {
+        mDataIt = skipLine<DataArrayIt>(mDataIt, mDataItEnd, mLine);
+        return;
+    }
+
+    mModel->mCurrentSmoothGroup = group;
+    mModel->mHasSmoothingStatement = true;
 
     mDataIt = skipLine<DataArrayIt>(mDataIt, mDataItEnd, mLine);
 }
