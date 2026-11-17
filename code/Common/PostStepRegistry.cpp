@@ -137,6 +137,9 @@ corresponding preprocessor flag to selectively disable steps.
 #if (!defined ASSIMP_BUILD_NO_GENBOUNDINGBOXES_PROCESS)
 #   include "PostProcessing/GenBoundingBoxesProcess.h"
 #endif
+#if (!defined ASSIMP_BUILD_NO_REGULARIZEANIMATIONKEYS_PROCESS)
+#   include "PostProcessing/RegularizeAnimationKeysProcess.h"
+#endif
 
 
 
@@ -150,7 +153,7 @@ void GetPostProcessingStepInstanceList(std::vector< BaseProcess* >& out)
     // of sequence it is executed. Steps that are added here are not
     // validated - as RegisterPPStep() does - all dependencies must be given.
     // ----------------------------------------------------------------------------
-    out.reserve(31);
+    out.reserve(32);
 #if (!defined ASSIMP_BUILD_NO_MAKELEFTHANDED_PROCESS)
     out.push_back( new MakeLeftHandedProcess());
 #endif
@@ -259,6 +262,11 @@ void GetPostProcessingStepInstanceList(std::vector< BaseProcess* >& out)
 #endif
 #if (!defined ASSIMP_BUILD_NO_GENBOUNDINGBOXES_PROCESS)
     out.push_back(new GenBoundingBoxesProcess);
+#endif
+#if (!defined ASSIMP_BUILD_NO_REGULARIZEANIMATIONKEYS_PROCESS)
+    // Opt-in step, gated by the AI_CONFIG_PP_AKR_ENABLE import property.
+    // Runs last so it sees the final key data produced by earlier steps.
+    out.push_back(new RegularizeAnimationKeysProcess());
 #endif
 }
 

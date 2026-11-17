@@ -782,6 +782,8 @@ SET( PostProcessing_SRCS
   PostProcessing/ArmaturePopulate.h
   PostProcessing/GenBoundingBoxesProcess.cpp
   PostProcessing/GenBoundingBoxesProcess.h
+  PostProcessing/RegularizeAnimationKeysProcess.cpp
+  PostProcessing/RegularizeAnimationKeysProcess.h
   PostProcessing/SplitByBoneCountProcess.cpp
   PostProcessing/SplitByBoneCountProcess.h
 )

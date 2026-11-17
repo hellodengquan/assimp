@@ -224,6 +224,7 @@ SET( POST_PROCESSES
   unit/utSortByPType.cpp
   unit/utSceneCombiner.cpp
   unit/utGenBoundingBoxesProcess.cpp
+  unit/utRegularizeAnimationKeys.cpp
 )
 
 SOURCE_GROUP( UnitTests\\Compiler      FILES unit/CCompilerTest.c )

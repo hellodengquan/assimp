@@ -1174,6 +1174,59 @@ enum aiComponent
 #   define AI_CONFIG_APP_SCALE_KEY 1.0
 #endif // AI_CONFIG_APP_SCALE_KEY
 
+// ---------------------------------------------------------------------------
+/** @brief Enable the optional animation key-frame regularization step.
+ *
+ *  When enabled, all imported animations are regularized: keys sharing the
+ *  same time stamp are merged if they carry semantically equivalent values
+ *  (rotation quaternions q and -q count as equivalent because they describe
+ *  the same orientation), out-of-order keys are sorted chronologically and
+ *  every resulting key series is strictly increasing in time. The animation
+ *  duration and the sampled poses are preserved.
+ *
+ *  Inputs whose authoring intent cannot be determined - in particular
+ *  conflicting values at the same time stamp or non-finite time values -
+ *  reject the whole animation, leave the original data untouched and fail
+ *  the import with an explicit error. When disabled, animations are kept
+ *  exactly as imported.
+ *
+ *  Property type: Bool. Default value: false.
+ */
+#define AI_CONFIG_PP_AKR_ENABLE "PP_AKR_ENABLE"
+
+// ---------------------------------------------------------------------------
+/** @brief Epsilon for comparing position and scaling key values during
+ *  animation key-frame regularization (#AI_CONFIG_PP_AKR_ENABLE).
+ *
+ *  Two vector keys at the same time stamp are considered redundant when each
+ *  component differs by no more than this absolute tolerance. A value of 0
+ *  requests exact comparison.
+ *
+ *  Property type: Float. Default value: 0.0.
+ */
+#define AI_CONFIG_PP_AKR_VECTOR_EPSILON "PP_AKR_VECTOR_EPSILON"
+
+#if (!defined AI_CONFIG_PP_AKR_VECTOR_EPSILON_DEFAULT)
+#   define AI_CONFIG_PP_AKR_VECTOR_EPSILON_DEFAULT 0.0f
+#endif
+
+// ---------------------------------------------------------------------------
+/** @brief Epsilon for comparing rotation quaternion key values during
+ *  animation key-frame regularization (#AI_CONFIG_PP_AKR_ENABLE).
+ *
+ *  Two quaternion keys at the same time stamp are considered redundant when
+ *  they are equal, or when one is the negation of the other (both describe
+ *  the same orientation), within this absolute per-component tolerance.
+ *  A value of 0 requests exact comparison.
+ *
+ *  Property type: Float. Default value: 0.0.
+ */
+#define AI_CONFIG_PP_AKR_QUATERNION_EPSILON "PP_AKR_QUATERNION_EPSILON"
+
+#if (!defined AI_CONFIG_PP_AKR_QUATERNION_EPSILON_DEFAULT)
+#   define AI_CONFIG_PP_AKR_QUATERNION_EPSILON_DEFAULT 0.0f
+#endif
+
 
 // ---------- All the Build/Compile-time defines ------------
 
