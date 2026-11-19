@@ -50,6 +50,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "ConvertToLHProcess.h"
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
+#include <assimp/light.h>
+#include <assimp/camera.h>
+#include <assimp/mesh.h>
+#include <assimp/anim.h>
 #include <assimp/DefaultLogger.hpp>
 
 using namespace Assimp;
@@ -57,6 +61,49 @@ using namespace Assimp;
 #ifndef ASSIMP_BUILD_NO_MAKELEFTHANDED_PROCESS
 
 namespace {
+
+// ------------------------------------------------------------------------------------------------
+// Reflection across the local Z = 0 plane. This is the single geometric relationship
+// used by the whole RH <-> LH conversion: all spatial data is expressed through this
+// same mirror, point-like and direction-like quantities only differ in meaning.
+//
+// Points and free vectors happen to use the same component transform (Z is negated),
+// but the distinction is kept explicit to document the semantics and to centralize
+// the handling of matrices and quaternions.
+void MirrorPoint(aiVector3D &v) {
+    v.z = -v.z;
+}
+
+void MirrorDirection(aiVector3D &v) {
+    v.z = -v.z;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Conjugate an affine transformation matrix with the Z reflection.
+// If M is the original transform and F = diag(1, 1, -1, 1), the mirrored transform is
+// F * M * F, which keeps the whole scene graph consistent with the mirrored vertex data.
+// For the row-major aiMatrix4x4 layout this negates the third row and the third column
+// (their intersection is negated twice and thus keeps its sign).
+void MirrorTransform(aiMatrix4x4 &m) {
+    m.a3 = -m.a3;
+    m.b3 = -m.b3;
+    // m.c3 is part of both the third row and third column.
+    m.d3 = -m.d3;
+
+    m.c1 = -m.c1;
+    m.c2 = -m.c2;
+    m.c4 = -m.c4;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Conjugate a rotation quaternion with the Z reflection. A reflected rotation is
+// F * R * F, which is again a rotation; expressed as a quaternion its X/Y components
+// are negated while W and Z keep their signs. The result stays normalized because the
+// negated components are the same as in the original quaternion.
+void MirrorRotation(aiQuaternion &q) {
+    q.x = -q.x;
+    q.y = -q.y;
+}
 
 template <typename aiMeshType>
 void flipUVs(aiMeshType *pMesh) {
@@ -71,6 +118,15 @@ void flipUVs(aiMeshType *pMesh) {
 
         for (unsigned int vIdx = 0; vIdx < pMesh->mNumVertices; vIdx++) {
             pMesh->mTextureCoords[tcIdx][vIdx].y = 1.0f - pMesh->mTextureCoords[tcIdx][vIdx].y;
+        }
+    }
+
+    // The bitangent points along the texture coordinate v axis. Flipping v
+    // reverses that axis, so the bitangent has to be negated as well. The
+    // tangent (u axis) and the geometric normal are not affected.
+    if (pMesh->HasTangentsAndBitangents()) {
+        for (unsigned int vIdx = 0; vIdx < pMesh->mNumVertices; vIdx++) {
+            pMesh->mBitangents[vIdx] *= -1.0f;
         }
     }
 }
@@ -113,32 +169,32 @@ void MakeLeftHandedProcess::Execute(aiScene *pScene) {
     }
 
     // process the cameras accordingly
-    for( unsigned int a = 0; a < pScene->mNumCameras; ++a)
-    {
+    for (unsigned int a = 0; a < pScene->mNumCameras; ++a) {
         ProcessCamera(pScene->mCameras[a]);
+    }
+
+    // process the lights accordingly
+    for (unsigned int a = 0; a < pScene->mNumLights; ++a) {
+        ProcessLight(pScene->mLights[a]);
+    }
+
+    // process the standalone skeletons accordingly
+    for (unsigned int a = 0; a < pScene->mNumSkeletons; ++a) {
+        ProcessSkeleton(pScene->mSkeletons[a]);
     }
     ASSIMP_LOG_DEBUG("MakeLeftHandedProcess finished");
 }
 
 // ------------------------------------------------------------------------------------------------
 // Recursively converts a node, all of its children and all of its meshes
-void MakeLeftHandedProcess::ProcessNode(aiNode *pNode, const aiMatrix4x4 &pParentGlobalRotation) {
-    // mirror all base vectors at the local Z axis
-    pNode->mTransformation.c1 = -pNode->mTransformation.c1;
-    pNode->mTransformation.c2 = -pNode->mTransformation.c2;
-    pNode->mTransformation.c3 = -pNode->mTransformation.c3;
-    pNode->mTransformation.c4 = -pNode->mTransformation.c4;
-
-    // now invert the Z axis again to keep the matrix determinant positive.
-    // The local meshes will be inverted accordingly so that the result should look just fine again.
-    pNode->mTransformation.a3 = -pNode->mTransformation.a3;
-    pNode->mTransformation.b3 = -pNode->mTransformation.b3;
-    pNode->mTransformation.c3 = -pNode->mTransformation.c3;
-    pNode->mTransformation.d3 = -pNode->mTransformation.d3; // useless, but anyways...
+void MakeLeftHandedProcess::ProcessNode(aiNode *pNode, const aiMatrix4x4 & /*pParentGlobalRotation*/) {
+    // Conjugate the node transformation with the Z reflection so that the
+    // transformed node graph reproduces the mirrored mesh data.
+    MirrorTransform(pNode->mTransformation);
 
     // continue for all children
     for (size_t a = 0; a < pNode->mNumChildren; ++a) {
-        ProcessNode(pNode->mChildren[a], pParentGlobalRotation * pNode->mTransformation);
+        ProcessNode(pNode->mChildren[a], aiMatrix4x4());
     }
 }
 
@@ -149,48 +205,53 @@ void MakeLeftHandedProcess::ProcessMesh(aiMesh *pMesh) {
         ASSIMP_LOG_ERROR("Nullptr to mesh found.");
         return;
     }
-    // mirror positions, normals and stuff along the Z axis
+
+    // mirror positions, normals, tangents and bitangents along the Z axis.
+    // Tangents and bitangents are plain direction vectors: mirroring them keeps
+    // the tangent space aligned with the mirrored geometry. The additional
+    // bitangent reversal that belongs to a texture coordinate flip is handled by
+    // FlipUVsProcess, independently of the execution order of the two steps.
     for (size_t a = 0; a < pMesh->mNumVertices; ++a) {
-        pMesh->mVertices[a].z *= -1.0f;
+        MirrorPoint(pMesh->mVertices[a]);
         if (pMesh->HasNormals()) {
-            pMesh->mNormals[a].z *= -1.0f;
+            MirrorDirection(pMesh->mNormals[a]);
         }
         if (pMesh->HasTangentsAndBitangents()) {
-            pMesh->mTangents[a].z *= -1.0f;
-            pMesh->mBitangents[a].z *= -1.0f;
+            MirrorDirection(pMesh->mTangents[a]);
+            MirrorDirection(pMesh->mBitangents[a]);
         }
     }
 
-    // mirror anim meshes positions, normals and stuff along the Z axis
+    // mirror the morph targets (anim meshes) with the exact same relationship
+    // as the base mesh so that every blend shape stays consistent with it.
     for (size_t m = 0; m < pMesh->mNumAnimMeshes; ++m) {
-        for (size_t a = 0; a < pMesh->mAnimMeshes[m]->mNumVertices; ++a) {
-            pMesh->mAnimMeshes[m]->mVertices[a].z *= -1.0f;
-            if (pMesh->mAnimMeshes[m]->HasNormals()) {
-                pMesh->mAnimMeshes[m]->mNormals[a].z *= -1.0f;
+        aiAnimMesh *animMesh = pMesh->mAnimMeshes[m];
+        for (size_t a = 0; a < animMesh->mNumVertices; ++a) {
+            if (animMesh->HasPositions()) {
+                MirrorPoint(animMesh->mVertices[a]);
             }
-            if (pMesh->mAnimMeshes[m]->HasTangentsAndBitangents()) {
-                pMesh->mAnimMeshes[m]->mTangents[a].z *= -1.0f;
-                pMesh->mAnimMeshes[m]->mBitangents[a].z *= -1.0f;
+            if (animMesh->HasNormals()) {
+                MirrorDirection(animMesh->mNormals[a]);
+            }
+            if (animMesh->HasTangentsAndBitangents()) {
+                MirrorDirection(animMesh->mTangents[a]);
+                MirrorDirection(animMesh->mBitangents[a]);
             }
         }
     }
 
-    // mirror offset matrices of all bones
+    // conjugate the offset matrices of all bones with the Z reflection
     for (size_t a = 0; a < pMesh->mNumBones; ++a) {
-        aiBone *bone = pMesh->mBones[a];
-        bone->mOffsetMatrix.a3 = -bone->mOffsetMatrix.a3;
-        bone->mOffsetMatrix.b3 = -bone->mOffsetMatrix.b3;
-        bone->mOffsetMatrix.d3 = -bone->mOffsetMatrix.d3;
-        bone->mOffsetMatrix.c1 = -bone->mOffsetMatrix.c1;
-        bone->mOffsetMatrix.c2 = -bone->mOffsetMatrix.c2;
-        bone->mOffsetMatrix.c4 = -bone->mOffsetMatrix.c4;
+        MirrorTransform(pMesh->mBones[a]->mOffsetMatrix);
     }
 
-    // mirror bitangents as well as they're derived from the texture coords
-    if (pMesh->HasTangentsAndBitangents()) {
-        for (unsigned int a = 0; a < pMesh->mNumVertices; a++)
-            pMesh->mBitangents[a] *= -1.0f;
-    }
+    // mirror the bounding box, swapping the negated Z extents back into order.
+    // A zero box stays zero, so no presence check is required.
+    MirrorPoint(pMesh->mAABB.mMin);
+    MirrorPoint(pMesh->mAABB.mMax);
+    const ai_real minZ = pMesh->mAABB.mMin.z;
+    pMesh->mAABB.mMin.z = pMesh->mAABB.mMax.z;
+    pMesh->mAABB.mMax.z = minZ;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -217,22 +278,67 @@ void MakeLeftHandedProcess::ProcessMaterial(aiMaterial *_mat) {
 // ------------------------------------------------------------------------------------------------
 // Converts the given animation to LH coordinates.
 void MakeLeftHandedProcess::ProcessAnimation(aiNodeAnim *pAnim) {
-    // position keys
-    for (unsigned int a = 0; a < pAnim->mNumPositionKeys; a++)
-        pAnim->mPositionKeys[a].mValue.z *= -1.0f;
-
-    // rotation keys
-    for (unsigned int a = 0; a < pAnim->mNumRotationKeys; a++) {
-        pAnim->mRotationKeys[a].mValue.x *= -1.0f;
-        pAnim->mRotationKeys[a].mValue.y *= -1.0f;
+    // position keys are points: mirror them across the Z = 0 plane
+    for (unsigned int a = 0; a < pAnim->mNumPositionKeys; a++) {
+        MirrorPoint(pAnim->mPositionKeys[a].mValue);
     }
+
+    // rotation keys are conjugated with the Z reflection, matching the
+    // converted node transformations.
+    for (unsigned int a = 0; a < pAnim->mNumRotationKeys; a++) {
+        MirrorRotation(pAnim->mRotationKeys[a].mValue);
+    }
+
+    // scaling keys are axis-local scalar factors and remain unchanged
 }
 
 // ------------------------------------------------------------------------------------------------
 // Converts a single camera to left handed coordinates.
-void MakeLeftHandedProcess::ProcessCamera( aiCamera* pCam)
-{
-    pCam->mLookAt = ai_real(2.0f) * pCam->mPosition - pCam->mLookAt;
+void MakeLeftHandedProcess::ProcessCamera(aiCamera *pCam) {
+    // The camera data is expressed in the coordinate space of its node, whose
+    // transformation has already been conjugated with the Z reflection. Mirroring
+    // the local vectors the same way therefore keeps the camera looking at the
+    // mirrored target region instead of turning it around.
+    MirrorPoint(pCam->mPosition);
+    MirrorPoint(pCam->mLookAt);
+    MirrorDirection(pCam->mUp);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Converts a single light to left handed coordinates.
+void MakeLeftHandedProcess::ProcessLight(aiLight *pLight) {
+    if (nullptr == pLight) {
+        ASSIMP_LOG_ERROR("Nullptr to aiLight found.");
+        return;
+    }
+
+    // The position is a point, direction and up are free vectors. All are local
+    // to the light's node, which has already been converted, so mirroring them
+    // with the same Z reflection keeps spot and directional lights pointing at
+    // the mirrored region of the scene.
+    MirrorPoint(pLight->mPosition);
+    MirrorDirection(pLight->mDirection);
+    MirrorDirection(pLight->mUp);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Converts a standalone skeleton to left handed coordinates.
+void MakeLeftHandedProcess::ProcessSkeleton(aiSkeleton *pSkeleton) {
+    if (nullptr == pSkeleton) {
+        ASSIMP_LOG_ERROR("Nullptr to aiSkeleton found.");
+        return;
+    }
+
+    // The skeleton matrices describe the same bone hierarchy as the scene nodes
+    // and mesh bones, so they use the exact same matrix conjugation.
+    for (unsigned int a = 0; a < pSkeleton->mNumBones; ++a) {
+        aiSkeletonBone *bone = pSkeleton->mBones[a];
+        if (nullptr == bone) {
+            continue;
+        }
+        MirrorTransform(bone->mOffsetMatrix);
+        MirrorTransform(bone->mLocalMatrix);
+    }
 }
 
 #endif // !!  ASSIMP_BUILD_NO_MAKELEFTHANDED_PROCESS
